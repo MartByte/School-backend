@@ -1,676 +1,273 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../db/connection');
+const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
+const Student = require('../models/Student');
+const Teacher = require('../models/Teacher');
+const Attendance = require('../models/Attendance');
+const CanteenFee = require('../models/CanteenFee');
 const isValidPhone = require('../utils/validatePhone');
 
-/**
- * CONFIGURATION & HELPERS
- */
+// Multer Setup
 const storage = multer.diskStorage({
     destination: 'uploads/',
     filename: (req, file, cb) => {
-        cb(null, `teacher_${Date.now()}${path.extname(file.originalname)}`);
+        cb(null, `img_${Date.now()}${path.extname(file.originalname)}`);
     },
 });
 const upload = multer({ storage });
 
-const normalizeProfilePic = (pic) => {
-    if (!pic) return null;
-    return pic.includes('/') ? pic.split('/').pop() : pic.replace('uploads/', '');
+// ID Generator Helper
+const generateID = async (type) => {
+    const year = new Date().getFullYear();
+    const prefix = type === 'student' ? 'STD' : 'TCH';
+    const count = type === 'student' ? await Student.countDocuments() : await Teacher.countDocuments();
+    return `${prefix}-${year}-${(count + 1).toString().padStart(4, '0')}`;
 };
 
 // ==========================================
-// 1. STUDENT MANAGEMENT
+// 1. STUDENT MANAGEMENT (5 Endpoints)
 // ==========================================
 
-// GET students by class (Read-only: No Socket Emit)
+// 1. GET students by class
 router.get('/by-class/:className', async (req, res) => {
     const { className } = req.params;
-    const today = new Date().toLocaleDateString('en-CA');
+    const today = new Date().toISOString().split('T')[0];
     try {
-        const [rows] = await db.query(
-            `SELECT 
-                s.studentID, 
-                CONCAT(s.Fname, ' ', s.Lname) AS fullName, 
-                s.town, 
-                s.class,
-                (SELECT status FROM attendance 
-                 WHERE studentID = s.studentID AND date = ? AND source = 'class' LIMIT 1) AS attendanceStatus,
-                (SELECT CASE WHEN amount > 0 THEN 'Paid' ELSE 'Unpaid' END 
-                 FROM canteen_fees 
-                 WHERE studentID = s.studentID AND date = ? LIMIT 1) AS paymentStatus
-             FROM students s
-             WHERE s.class = ? AND s.isDeleted = 0
-             ORDER BY s.Lname ASC`,
-            [today, today, className]
-        );
+        const students = await Student.find({ class: className, isDeleted: false }).sort({ Lname: 1 });
+        const rows = await Promise.all(students.map(async (s) => {
+            const attn = await Attendance.findOne({ studentID: s.studentID, date: today, source: 'class' });
+            const fee = await CanteenFee.findOne({ studentID: s.studentID, date: today });
+            return {
+                studentID: s.studentID,
+                fullName: `${s.Fname} ${s.Lname}`,
+                town: s.town,
+                class: s.class,
+                attendanceStatus: attn ? attn.status : null,
+                paymentStatus: fee ? 'Paid' : 'Unpaid'
+            };
+        }));
         res.json(rows);
-    } catch (err) {
-        res.status(500).json({ message: 'Internal Server Error' });
-    }
+    } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ADD Student (Write-only: Sockets used to notify Admin)
+// 2. POST add student
 router.post('/students/add', upload.single('profilePic'), async (req, res) => {
     const { Fname, Mname, Lname, class: className, town, guardianPhone } = req.body;
-    
-    // 1. Validate Phone
-    const validatedPhone = isValidPhone(guardianPhone);
-    if (!validatedPhone) {
-        return res.status(400).json({ success: false, message: 'Invalid phone format' });
-    }
-
-    const conn = await db.getConnection();
+    const validP = isValidPhone(guardianPhone);
+    if (!validP) return res.status(400).json({ success: false, message: 'Invalid phone' });
     try {
-        await conn.beginTransaction();
-
-        // 2. Generate Custom ID (e.g., STD-2026-0001)
-        await conn.query("CALL generate_custom_id('student', @newID)");
-        const [[{ '@newID': studentID }]] = await conn.query("SELECT @newID");
-
-        if (!studentID) throw new Error("ID Generation Failed");
-
-        // 3. Insert Student Data
-        const sql = `
-            INSERT INTO students (
-                studentID, Fname, Mname, Lname, class, town, guardianPhone, profilePic
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
-        
-        const params = [
-            studentID, 
-            Fname.trim(), 
-            Mname ? Mname.trim() : null, 
-            Lname.trim(), 
-            className, 
-            town, 
-            validatedPhone,
-            req.file ? req.file.filename : null
-        ];
-
-        await conn.query(sql, params);
-        await conn.commit();
-
-        // 4. Socket.io Real-time Notification
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('refresh_data', { 
-                type: 'attendance_update', 
-                message: `New student ${Fname} added` 
-            });
-        }
-
+        const studentID = await generateID('student');
+        const s = new Student({ studentID, Fname, Mname, Lname, class: className, town, guardianPhone: validP, profilePic: req.file?.filename });
+        await s.save();
+        req.app.get('io')?.emit('refresh_data');
         res.status(201).json({ success: true, studentID });
-
-    } catch (err) {
-        await conn.rollback();
-        console.error("Add Student Error:", err);
-        res.status(500).json({ success: false, message: 'Failed to add student to database' });
-    } finally {
-        conn.release();
-    }
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
+// 3. GET students by town
 router.get('/by-town/:townName', async (req, res) => {
-    const { townName } = req.params;
     try {
-        const [rows] = await db.query(
-            `SELECT 
-                studentID, 
-                CONCAT(Fname, ' ', Lname) AS fullName, 
-                town, 
-                class 
-             FROM students 
-             WHERE town = ? AND isDeleted = 0
-             ORDER BY Lname ASC`,
-            [townName]
-        );
-        res.json(rows);
-    } catch (err) {
-        console.error('Error fetching students by town:', err);
-        res.status(500).json({ message: 'Internal server error' });
-    }
+        const students = await Student.find({ town: req.params.townName, isDeleted: false }).sort({ Lname: 1 });
+        res.json(students.map(s => ({ studentID: s.studentID, fullName: `${s.Fname} ${s.Lname}`, town: s.town, class: s.class })));
+    } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// 4. GET all students
 router.get('/students/all', async (req, res) => {
     try {
-        const [students] = await db.query('SELECT * FROM students ORDER BY Lname ASC');
+        const students = await Student.find().sort({ Lname: 1 });
         res.json(students);
-    } catch (err) {
-        res.status(500).json({ message: 'Internal server error' });
-    }
+    } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-
+// 5. PUT edit student
 router.put('/students/edit/:studentID', async (req, res) => {
-    const { studentID } = req.params;
-    const { Fname, Mname, Lname, className, town } = req.body;
     try {
-        await db.query(
-            `UPDATE students SET Fname=?, Mname=?, Lname=?, class=?, town=? WHERE studentID=?`,
-            [Fname, Mname, Lname, className, town, studentID]
-        );
-//         const io = req.app.get('io');
-// io.emit('refresh_data', { message: 'New activity detected' });
+        await Student.findOneAndUpdate({ studentID: req.params.studentID }, req.body);
         res.json({ message: 'Student updated' });
     } catch (err) { res.status(500).json({ message: 'Update failed' }); }
 });
 
-
 // ==========================================
-// 2. TEACHER MANAGEMENT
+// 2. TEACHER MANAGEMENT (4 Endpoints)
 // ==========================================
 
+// 6. GET all teachers
 router.get('/all/teachers', async (req, res) => {
     try {
-        const [rows] = await db.query(
-            `SELECT teacherID, CONCAT(Fname, ' ', Lname) AS fullName, email, phone, assignedClass, profilePic, town,
-                (SELECT status FROM attendance WHERE teacherID = teachers.teacherID AND date = CURDATE() LIMIT 1) as attendanceStatus
-             FROM teachers WHERE isDeleted = 0 ORDER BY Lname ASC`
-        );
-        res.json(rows);
-    } catch (err) {
-        res.status(500).json({ message: 'Failed to fetch teachers' });
-    }
+        const teachers = await Teacher.find({ isDeleted: false }).sort({ Lname: 1 });
+        res.json(teachers.map(t => ({ ...t._doc, fullName: `${t.Fname} ${t.Lname}` })));
+    } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// 7. POST add teacher
 router.post('/add-teacher', upload.single('profilePic'), async (req, res) => {
-    const { 
-        Fname, Mname, Lname, phone, role, 
-        town, assignedClass, isCanteenCollector 
-    } = req.body;
-
-    // 1. Validate Phone
-    const formattedPhone = isValidPhone(phone);
-    if (!formattedPhone) {
-        return res.status(400).json({ success: false, message: 'Invalid phone format' });
-    }
-
-    // 2. Database Connection Logic
-    const connection = await db.getConnection(); 
     try {
-        await connection.beginTransaction();
-
-        // 3. Generate Custom ID using your Procedure
-        await connection.query(`CALL generate_custom_id('teacher', @newID)`);
-        const [[{ '@newID': teacherID }]] = await connection.query("SELECT @newID");
-
-        if (!teacherID) throw new Error("Failed to generate Teacher ID");
-
-        // 4. Data Normalization
-        // FormData sends "0"/"1" as strings. Convert to Integer for MySQL BIT or TINYINT
-        const collectorValue = parseInt(isCanteenCollector) === 1 ? 1 : 0;
-        
-        const sql = `
-            INSERT INTO teachers (
-                teacherID, Fname, Mname, Lname, phone, 
-                role, town, assignedClass, isCanteenCollector, profilePic
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-
-        const params = [
-            teacherID,
-            Fname.trim(),
-            Mname ? Mname.trim() : null,
-            Lname.trim(),
-            formattedPhone,
-            role || 'teacher',
-            town ? town.trim() : null,
-            assignedClass ? assignedClass.trim() : null,
-            collectorValue,
-            req.file ? req.file.filename : null // Save the filename from Multer
-        ];
-
-        await connection.query(sql, params);
-        await connection.commit();
-
-        res.status(200).json({ 
-            success: true, 
-            message: 'Teacher added successfully', 
-            teacherID 
-        });
-
-    } catch (err) {
-        await connection.rollback();
-        console.error("Add Teacher Error:", err);
-        res.status(500).json({ success: false, message: 'Database insertion failed' });
-    } finally {
-        connection.release();
-    }
+        const teacherID = await generateID('teacher');
+        const t = new Teacher({ ...req.body, teacherID, profilePic: req.file?.filename });
+        await t.save();
+        res.status(200).json({ success: true, teacherID });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
+// 8. GET teacher attendance
 router.get('/teachers/attendance', async (req, res) => {
     const date = req.query.date || new Date().toISOString().split('T')[0];
     try {
-        const [rows] = await db.query(`
-            SELECT 
-                t.teacherID, 
-                t.Fname, 
-                t.Lname, 
-                t.profilePic, 
-                a.status -- This will be NULL if you haven't marked it
-            FROM teachers t
-            LEFT JOIN teacher_attendance a ON t.teacherID = a.teacherID AND a.date = ?
-            WHERE t.isDeleted = 0 
-            ORDER BY t.Lname`, 
-        [date]);
-
-        res.json(rows.map(t => ({ 
-            ...t, 
-            status: t.status || null, // Explicitly send null if not in table
-            profilePic: normalizeProfilePic(t.profilePic) 
-        })));
-    } catch (err) { 
-        console.error(err);
-        res.status(500).json({ message: 'Fetch failed' }); 
-    }
+        const teachers = await Teacher.find({ isDeleted: false });
+        const rows = await Promise.all(teachers.map(async (t) => {
+            const a = await Attendance.findOne({ teacherID: t.teacherID, date, source: 'staff' });
+            return { teacherID: t.teacherID, Fname: t.Fname, Lname: t.Lname, status: a?.status || null };
+        }));
+        res.json(rows);
+    } catch (err) { res.status(500).json({ message: 'Fetch failed' }); }
 });
 
+// 9. POST teacher attendance
 router.post('/teachers/attendance', async (req, res) => {
     const { attendanceList, date } = req.body;
-
-    if (!attendanceList || !Array.isArray(attendanceList)) {
-        return res.status(400).json({ success: false, message: 'Invalid data format' });
-    }
-
-    const connection = await db.getConnection();
     try {
-        await connection.beginTransaction();
-
-        // Loop through the list and update/insert each record
         for (const record of attendanceList) {
-            await connection.query(`
-                INSERT INTO teacher_attendance (teacherID, date, status, markedBy)
-                VALUES (?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE 
-                    status = VALUES(status),
-                    markedBy = VALUES(markedBy)
-            `, [record.teacherID, date, record.status, record.markedBy]);
+            await Attendance.findOneAndUpdate(
+                { teacherID: record.teacherID, date, source: 'staff' },
+                { status: record.status, markedBy: record.markedBy },
+                { upsert: true }
+            );
         }
-
-        await connection.commit();
-        res.json({ success: true, message: 'Attendance saved successfully' });
-    } catch (err) {
-        await connection.rollback();
-        console.error("Teacher Attendance Save Error:", err);
-        res.status(500).json({ success: false, message: 'Database error' });
-    } finally {
-        connection.release();
-    }
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
 // ==========================================
-// 3. THE ADMIN DASHBOARD (CENTRAL HUB)
+// 3. DASHBOARD & STATS (3 Endpoints)
 // ==========================================
 
+// 10. POST admin summary (The Main Dashboard)
 router.post('/dashboard/admin-summary', async (req, res) => {
+    const today = new Date().toISOString().split('T')[0];
     try {
-        // Using YYYY-MM-DD format to match database DATE columns
-        const today = new Date().toLocaleDateString('en-CA'); 
-        
-        // Parallel queries for high performance
-        const [ 
-            [s],        // Total Students
-            [t],        // Total Teachers
-            [rev],      // Total Revenue (Daily + Topups)
-            [classAtt], // Total Present in Class
-            [feesData], // Breakdown of payment types
-            [gap]       // The Audit Gap (In Class but NOT in Canteen Fees)
-        ] = await Promise.all([
-            // 1. Total active students
-            db.query("SELECT COUNT(*) as count FROM students WHERE isDeleted = 0"),
-
-            // 2. Total active teachers
-            db.query("SELECT COUNT(*) as count FROM teachers WHERE isDeleted = 0"),
-
-            // 3. Total Cash Revenue collected today
-            db.query(`SELECT SUM(amount) as total FROM canteen_fees 
-                      WHERE DATE(date) = ? AND paymentType IN ('daily', 'advance_topup')`, [today]),
-
-            // 4. Students marked present in class
-            db.query(`SELECT COUNT(DISTINCT studentID) as count FROM attendance 
-                      WHERE DATE(date) = ? AND source = 'class' AND status = 'present'`, [today]),
-
-            // 5. Canteen Statistics (How many ate per category)
-            db.query(`SELECT 
-                        COUNT(DISTINCT CASE WHEN paymentType = 'daily' THEN studentID END) as dailyEaten,
-                        COUNT(DISTINCT CASE WHEN paymentType = 'advance' THEN studentID END) as advEaten,
-                        COUNT(DISTINCT CASE WHEN paymentType = 'credit' THEN studentID END) as creditEaten,
-                        COUNT(DISTINCT studentID) as totalEaten
-                      FROM canteen_fees WHERE DATE(date) = ? AND paymentType != 'advance_topup'`, [today]),
-
-            // 6. THE AUDIT GAP: Present in class but NO record in canteen_fees
-            db.query(`SELECT COUNT(DISTINCT a.studentID) as count 
-                      FROM attendance a 
-                      WHERE DATE(a.date) = ? 
-                      AND a.source = 'class' 
-                      AND a.status = 'present' 
-                      AND NOT EXISTS (
-                          SELECT 1 FROM canteen_fees c 
-                          WHERE c.studentID = a.studentID 
-                          AND DATE(c.date) = ? 
-                          AND c.paymentType != 'advance_topup'
-                      )`, [today, today])
+        const [s, t, rev, classP, cStats] = await Promise.all([
+            Student.countDocuments({ isDeleted: false }),
+            Teacher.countDocuments({ isDeleted: false }),
+            CanteenFee.aggregate([{ $match: { date: today, paymentType: { $in: ['daily', 'advance_topup'] } } }, { $group: { _id: null, total: { $sum: "$amount" } } }]),
+            Attendance.countDocuments({ date: today, source: 'class', status: 'present' }),
+            CanteenFee.aggregate([{ $match: { date: today, paymentType: { $ne: 'advance_topup' } } }, { $group: { _id: null, daily: { $sum: { $cond: [{ $eq: ["$paymentType", "daily"] }, 1, 0] } }, adv: { $sum: { $cond: [{ $eq: ["$paymentType", "advance"] }, 1, 0] } }, credit: { $sum: { $cond: [{ $eq: ["$paymentType", "credit"] }, 1, 0] } }, total: { $sum: 1 } } }])
         ]);
-
-        // Calculate Totals safely
-        const totalPaidCount = (feesData[0].dailyEaten || 0) + 
-                             (feesData[0].advEaten || 0) + 
-                             (feesData[0].creditEaten || 0);
-
-        res.json({
-            totalStudents: s[0].count,
-            totalTeachers: t[0].count,
-            totalCollected: rev[0].total || 0,
-            canteenPresent: feesData[0].totalEaten || 0, // Now matches your report exactly
-            classPresent: classAtt[0].count,
-            dailyCount: feesData[0].dailyEaten,
-            advanceCount: feesData[0].advEaten,
-            debitCount: feesData[0].creditEaten,
-            missedCanteen: gap[0].count // Students who are in class but haven't paid/eaten
-        });
-
-    } catch (err) { 
-        console.error("Dashboard Summary Error:", err);
-        res.status(500).json({ error: err.message }); 
-    }
+        const cs = cStats[0] || {};
+        res.json({ totalStudents: s, totalTeachers: t, totalCollected: rev[0]?.total || 0, canteenPresent: cs.total || 0, classPresent: classP, dailyCount: cs.daily || 0, advanceCount: cs.adv || 0, debitCount: cs.credit || 0, missedCanteen: classP - (cs.total || 0) });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-
+// 11. GET global stats
 router.get('/global-stats', async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     try {
-        const [stats] = await db.query(`
-            SELECT 
-                (SELECT COUNT(*) FROM students) as totalStudents,
-                (SELECT COUNT(DISTINCT studentID) FROM attendance WHERE date = ? AND status = 'present') as presentToday,
-                (SELECT SUM(amount) FROM canteen_fees WHERE date = ?) as revenue
-            `, [today, today]);
-
-        res.json({ success: true, data: stats[0] });
-    } catch (err) {
-        res.status(500).json({ success: false, message: "Database error" });
-    }
+        const present = await Attendance.countDocuments({ date: today, status: 'present' });
+        const revenue = await CanteenFee.aggregate([{ $match: { date: today } }, { $group: { _id: null, total: { $sum: "$amount" } } }]);
+        res.json({ success: true, data: { totalStudents: await Student.countDocuments(), presentToday: present, revenue: revenue[0]?.total || 0 } });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
-
+// 12. GET attendance summary (By Class)
 router.get('/attendance-summary', async (req, res) => {
     const { date } = req.query;
     try {
-        const [rows] = await db.query(`
-            SELECT 
-                s.class,
-                COUNT(DISTINCT s.studentID) as total_students,
-                COUNT(DISTINCT a.studentID) as marked_count,
-                SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) as present_count
-            FROM students s
-            LEFT JOIN attendance a ON s.studentID = a.studentID AND a.date = ?
-            GROUP BY s.class
-            ORDER BY s.class ASC
-        `, [date]);
-        const io = req.app.get('io');
-io.emit('refresh_data', { message: 'New activity detected' });
-
-
-        res.json({ success: true, data: rows });
-    } catch (err) {
-        res.status(500).json({ success: false, message: "Database error" });
-    }
+        const summary = await Student.aggregate([
+            { $group: { _id: "$class", total_students: { $sum: 1 } } },
+            { $lookup: { from: "attendances", let: { cls: "$_id" }, pipeline: [{ $match: { $expr: { $and: [{ $eq: ["$class", "$$cls"] }, { $eq: ["$date", date] }, { $eq: ["$status", "present"] }] } } }], as: "p" } },
+            { $project: { class: "$_id", total_students: 1, present_count: { $size: "$p" } } },
+            { $sort: { class: 1 } }
+        ]);
+        res.json({ success: true, data: summary });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
+// ==========================================
+// 4. REPORTS & AUDITS (6 Endpoints)
+// ==========================================
+
+// 13. GET audit gap details
 router.get('/reports/audit-gap-details', async (req, res) => {
-    // Standardize date to YYYY-MM-DD
-    const today = new Date().toLocaleDateString('en-CA'); 
-
+    const today = new Date().toISOString().split('T')[0];
     try {
-        const [students] = await db.query(`
-            SELECT 
-                s.studentID, 
-                -- Concatenate names, handling NULL Middle Names gracefully
-                TRIM(CONCAT(s.Fname, ' ', IFNULL(s.Mname, ''), ' ', s.Lname)) AS name,
-                s.class, 
-                s.town
-            FROM attendance a
-            JOIN students s ON a.studentID = s.studentID
-            WHERE DATE(a.date) = ? 
-              AND a.source = 'class' 
-              AND a.status = 'present'
-              AND NOT EXISTS (
-                  SELECT 1 FROM canteen_fees c 
-                  WHERE c.studentID = a.studentID 
-                    AND DATE(c.date) = ?
-              )
-            ORDER BY s.class ASC, s.Fname ASC`, [today, today]);
-            
-        res.json({ success: true, data: students });
-    } catch (err) {
-        console.error("Audit Gap API Error:", err);
-        res.status(500).json({ success: false, message: err.message });
-    }
+        const presentIDs = await Attendance.find({ date: today, source: 'class', status: 'present' }).distinct('studentID');
+        const fedIDs = await CanteenFee.find({ date: today }).distinct('studentID');
+        const gapIDs = presentIDs.filter(id => !fedIDs.includes(id));
+        const students = await Student.find({ studentID: { $in: gapIDs } });
+        res.json({ success: true, data: students.map(s => ({ studentID: s.studentID, name: `${s.Fname} ${s.Lname}`, class: s.class, town: s.town })) });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
+// 14. GET balances report
 router.get('/reports/balances', async (req, res) => {
     try {
-        const query = `
-            SELECT 
-                s.studentID, 
-                CONCAT(s.Fname, ' ', IFNULL(s.Mname, ''), ' ', s.Lname) AS name, 
-                s.class, 
-                s.town, 
-                CAST(IFNULL(b.balance, 0) AS DECIMAL(10,2)) AS balance,
-                IFNULL(cf.active, 0) as is_credit
-            FROM students s
-            -- LEFT JOIN to check balances and credit status
-            LEFT JOIN canteen_balances b ON s.studentID = b.studentID
-            LEFT JOIN canteen_credit_flags cf ON s.studentID = cf.studentID
-            -- FILTER: Only show if they have a non-zero balance OR are a Credit student
-            WHERE IFNULL(b.balance, 0) != 0 OR IFNULL(cf.active, 0) = 1
-            ORDER BY b.balance ASC;
-        `;
-
-        const [rows] = await db.query(query);
-        res.json({ success: true, data: rows });
-    } catch (err) {
-        console.error("Report Error:", err.message);
-        res.status(500).json({ success: false, message: "Database error" });
-    }
+        const students = await Student.find({ $or: [{ advanceBalance: { $ne: 0 } }, { isCredit: true }] });
+        res.json({ success: true, data: students.map(s => ({ studentID: s.studentID, name: `${s.Fname} ${s.Lname}`, class: s.class, town: s.town, balance: s.advanceBalance, is_credit: s.isCredit ? 1 : 0 })) });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
-
-// ==========================================
-// 4. REPORTS & DOWNLOADS
-// ==========================================
-
-// --- 1. DAILY CANTEEN REPORT ---
+// 15. GET daily report
 router.get('/reports/canteen/daily', async (req, res) => {
-    let { date, town } = req.query;
-    if (!date) date = new Date().toISOString().split('T')[0];
-    else if (date.includes('T')) date = date.split('T')[0];
-
+    const date = req.query.date?.split('T')[0] || new Date().toISOString().split('T')[0];
     try {
-        let sql = `
-            SELECT 
-                s.studentID, 
-                CONCAT(s.Fname, ' ', s.Lname) as name, 
-                MAX(s.class) as class,
-                MAX(s.town) as town,
-                MAX(CASE WHEN a.source = 'class' AND a.status = 'present' THEN 1 ELSE 0 END) as inClass,
-                MAX(CASE WHEN a.source = 'canteen' AND a.status = 'present' THEN 1 ELSE 0 END) as inCanteen,
-                
-                -- Physical Cash
-                (SELECT IFNULL(SUM(amount), 0) FROM canteen_fees 
-                 WHERE studentID = s.studentID AND DATE(date) = DATE(?) 
-                 AND paymentType IN ('daily', 'advance_topup')) as cashReceived,
-
-                -- Debt Incurred
-                (SELECT IFNULL(SUM(amount), 0) FROM canteen_fees 
-                 WHERE studentID = s.studentID AND DATE(date) = DATE(?) 
-                 AND paymentType = 'credit') as creditIncurred,
-
-                -- Pre-paid Used
-                (SELECT IFNULL(SUM(amount), 0) FROM canteen_fees 
-                 WHERE studentID = s.studentID AND DATE(date) = DATE(?) 
-                 AND paymentType = 'advance') as balanceUsed,
-
-                -- Exemption Check (0.00 but present)
-                (SELECT COUNT(*) FROM canteen_fees 
-                 WHERE studentID = s.studentID AND DATE(date) = DATE(?) 
-                 AND paymentType = 'exempt') as isExempt,
-                
-                IFNULL((SELECT paymentType FROM canteen_fees 
-                 WHERE studentID = s.studentID AND DATE(date) = DATE(?)
-                 ORDER BY (CASE 
-                    WHEN paymentType = 'advance_topup' THEN 1 
-                    WHEN paymentType = 'daily' THEN 2 
-                    WHEN paymentType = 'advance' THEN 3
-                    WHEN paymentType = 'credit' THEN 4
-                    WHEN paymentType = 'exempt' THEN 5
-                    ELSE 6 END) ASC LIMIT 1), 'daily') as pTypes
-                    
-            FROM students s
-            LEFT JOIN attendance a ON s.studentID = a.studentID AND DATE(a.date) = DATE(?)
-            WHERE 1=1
-        `;
-        
-        const params = [date, date, date, date, date, date];
-        if (town && town !== 'All Towns' && town !== '') { 
-            sql += " AND s.town = ?"; 
-            params.push(town); 
-        }
-
-        sql += ` GROUP BY s.studentID 
-                 HAVING inClass = 1 OR inCanteen = 1 OR cashReceived > 0 OR balanceUsed > 0 OR creditIncurred > 0 OR isExempt > 0
-                 ORDER BY s.class ASC, name ASC`; 
-
-        const [rows] = await db.query(sql, params);
-        res.json({ success: true, date: date, data: rows });
-    } catch (err) { 
-        res.status(500).json({ success: false, message: "Internal Server Error" }); 
-    }
+        const fees = await CanteenFee.find({ date });
+        const data = await Promise.all(fees.map(async (f) => {
+            const s = await Student.findOne({ studentID: f.studentID });
+            return { studentID: f.studentID, name: `${s?.Fname} ${s?.Lname}`, class: s?.class, town: s?.town, cashReceived: f.paymentType === 'daily' ? f.amount : 0, creditIncurred: f.paymentType === 'credit' ? f.amount : 0, balanceUsed: f.paymentType === 'advance' ? f.amount : 0, pTypes: f.paymentType };
+        }));
+        res.json({ success: true, date, data });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
-// --- 2. WEEKLY SUMMARY REPORT ---
+// 16. GET weekly report
 router.get('/reports/weekly', async (req, res) => {
-    const { town, startDate, endDate } = req.query;
-
+    const { startDate, endDate } = req.query;
     try {
-        let sql = `
-            SELECT 
-                s.town,
-                COUNT(DISTINCT cf.studentID) as studentCount,
-                -- Real Physical Cash
-                SUM(CASE WHEN cf.paymentType IN ('daily', 'advance_topup') THEN cf.amount ELSE 0 END) as realCashIn,
-                -- Digital Value (Advance Used)
-                SUM(CASE WHEN cf.paymentType = 'advance' THEN cf.amount ELSE 0 END) as advanceDeductions,
-                -- Debt Value (Credit)
-                SUM(CASE WHEN cf.paymentType = 'credit' THEN cf.amount ELSE 0 END) as creditDebt,
-                -- Free Meals (Exempted)
-                SUM(CASE WHEN cf.paymentType = 'exempt' THEN 1 ELSE 0 END) as exemptCount
-            FROM canteen_fees cf
-            LEFT JOIN students s ON cf.studentID = s.studentID
-            WHERE DATE(cf.date) >= DATE(?) AND DATE(cf.date) <= DATE(?)
-        `;
-        
-        const params = [startDate, endDate];
-        if (town && town !== 'All Towns' && town !== '') {
-            sql += " AND s.town = ?";
-            params.push(town);
-        }
-
-        sql += " GROUP BY s.town ORDER BY s.town ASC";
-        const [rows] = await db.query(sql, params);
-        res.json({ success: true, data: rows });
-    } catch (err) {
-        res.status(500).json({ success: false, message: "Weekly report error" });
-    }
+        const report = await CanteenFee.aggregate([
+            { $match: { date: { $gte: startDate, $lte: endDate } } },
+            { $group: { _id: "$town", studentCount: { $addToSet: "$studentID" }, realCashIn: { $sum: { $cond: [{ $in: ["$paymentType", ["daily", "advance_topup"]] }, "$amount", 0] } }, advanceDeductions: { $sum: { $cond: [{ $eq: ["$paymentType", "advance"] }, "$amount", 0] } }, creditDebt: { $sum: { $cond: [{ $eq: ["$paymentType", "credit"] }, "$amount", 0] } } } },
+            { $project: { town: "$_id", studentCount: { $size: "$studentCount" }, realCashIn: 1, advanceDeductions: 1, creditDebt: 1 } }
+        ]);
+        res.json({ success: true, data: report });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
-// --- 3. MONTHLY REPORT ---
+// 17. GET monthly report
 router.get('/reports/canteen/monthly', async (req, res) => {
     const { month, year } = req.query;
     try {
-        const query = `
-            SELECT 
-                s.town,
-                s.class,
-                COUNT(DISTINCT cf.studentID) as studentsServed,
-                -- Financial Breakdown
-                SUM(CASE WHEN cf.paymentType IN ('daily', 'advance_topup') THEN cf.amount ELSE 0 END) as totalCashCollected,
-                SUM(CASE WHEN cf.paymentType = 'advance' THEN cf.amount ELSE 0 END) as balanceValueConsumed,
-                SUM(CASE WHEN cf.paymentType = 'credit' THEN cf.amount ELSE 0 END) as creditDebtIncurred,
-                SUM(CASE WHEN cf.paymentType = 'exempt' THEN 1 ELSE 0 END) as totalExemptedServed
-            FROM canteen_fees cf
-            LEFT JOIN students s ON cf.studentID = s.studentID
-            WHERE MONTH(cf.date) = ? AND YEAR(cf.date) = ?
-            GROUP BY s.town, s.class
-            ORDER BY s.town ASC, s.class ASC
-        `;
-        const [rows] = await db.query(query, [month, year]);
-        res.json({ success: true, data: rows });
-    } catch (err) {
-        res.status(500).json({ success: false, message: "Monthly report error" });
-    }
+        const start = `${year}-${month.padStart(2, '0')}-01`;
+        const end = `${year}-${month.padStart(2, '0')}-31`;
+        const data = await CanteenFee.aggregate([
+            { $match: { date: { $gte: start, $lte: end } } },
+            { $group: { _id: { town: "$town", class: "$class" }, studentsServed: { $addToSet: "$studentID" }, totalCashCollected: { $sum: { $cond: [{ $in: ["$paymentType", ["daily", "advance_topup"]] }, "$amount", 0] } } } },
+            { $project: { town: "$_id.town", class: "$_id.class", studentsServed: { $size: "$studentsServed" }, totalCashCollected: 1 } }
+        ]);
+        res.json({ success: true, data });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
-// --- 4. YEARLY REPORT ---
+// 18. GET yearly report
 router.get('/reports/canteen/yearly', async (req, res) => {
     const { year } = req.query;
-    if (!year) return res.status(400).json({ message: 'Year is required' });
-
     try {
-        const [rows] = await db.query(`
-            SELECT 
-                town,
-                MONTHNAME(date) as month,
-                MONTH(date) as monthNum,
-                COUNT(DISTINCT studentID) as uniqueStudents,
-                SUM(CASE WHEN paymentType IN ('daily', 'advance_topup') THEN amount ELSE 0 END) as cashCollected,
-                SUM(CASE WHEN paymentType = 'advance' THEN amount ELSE 0 END) as balanceConsumed,
-                SUM(CASE WHEN paymentType = 'credit' THEN amount ELSE 0 END) as debtIncurred,
-                SUM(amount) as totalBusinessValue
-            FROM canteen_fees 
-            WHERE YEAR(date) = ?
-            GROUP BY town, month, monthNum 
-            ORDER BY monthNum ASC, town ASC`, 
-            [year]
-        );
-
-        const [[stats]] = await db.query(`
-            SELECT 
-                SUM(CASE WHEN paymentType IN ('daily', 'advance_topup') THEN amount ELSE 0 END) as totalCash,
-                SUM(CASE WHEN paymentType = 'advance' THEN amount ELSE 0 END) as totalLiabilityUsed,
-                SUM(CASE WHEN paymentType = 'credit' THEN amount ELSE 0 END) as totalCreditDebt,
-                COUNT(DISTINCT studentID) as totalStudentsServed
-            FROM canteen_fees 
-            WHERE YEAR(date) = ?`, 
-            [year]
-        );
-
-        res.json({
-            success: true,
-            year: year,
-            data: rows,
-            stats: {
-                grandTotalCash: stats.totalCash || 0,
-                grandTotalConsumption: stats.totalLiabilityUsed || 0,
-                grandTotalDebt: stats.totalCreditDebt || 0, // Frontend looks for grandTotalDebt
-                totalStudents: stats.totalStudentsServed || 0
-            }
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ success: false, message: 'Yearly report error' });
-    }
+        const data = await CanteenFee.aggregate([
+            { $match: { date: { $regex: `^${year}` } } },
+            { $group: { _id: { town: "$town", month: { $substr: ["$date", 5, 2] } }, cashCollected: { $sum: "$amount" }, uniqueStudents: { $addToSet: "$studentID" } } },
+            { $project: { town: "$_id.town", month: "$_id.month", cashCollected: 1, uniqueStudents: { $size: "$uniqueStudents" } } }
+        ]);
+        res.json({ success: true, data });
+    } catch (err) { res.status(500).json({ success: false }); }
 });
-// ==========================================
-// 5. UTILITIES
-// ==========================================
 
+// 19. GET towns (Utility)
 router.get('/towns', async (req, res) => {
     try {
-        const [rows] = await db.query("SELECT DISTINCT town FROM students WHERE town IS NOT NULL ORDER BY town");
-        res.json(rows.map(r => r.town));
-    } catch (err) { res.status(500).json({ message: 'Town fetch failed' }); }
+        const towns = await Student.distinct('town');
+        res.json(towns);
+    } catch (err) { res.status(500).json({ message: 'Failed' }); }
 });
 
 module.exports = router;

@@ -1,249 +1,161 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../db/connection');
+const Student = require('../models/Student');
+const Attendance = require('../models/Attendance');
+const CanteenFee = require('../models/CanteenFee');
 
-/**
- * GET /canteen/collect?town=...&date=YYYY-MM-DD
- * Returns: { town, date, dailyFee, classes: [{ class, groups:{ normal[], advance[], credit[], exempted[] } }] }
- */
-
-
+// ========== GET /canteen/collect ==========
 router.get('/collect', async (req, res) => {
     const { town, date } = req.query;
-
-    if (!town || !date) {
-        return res.status(400).json({ success: false, message: "Town and date are required." });
-    }
+    if (!town || !date) return res.status(400).json({ success: false, message: "Missing data" });
 
     try {
-        const [rows] = await db.query(`
-            SELECT 
-                s.studentID, s.Fname, s.Lname, s.class, s.town,
-                (SELECT status FROM attendance 
-                 WHERE studentID = s.studentID AND date = ? 
-                 ORDER BY id DESC LIMIT 1) as attendanceStatus,
-                (SELECT amount FROM canteen_fees 
-                 WHERE studentID = s.studentID AND date = ? 
-                 ORDER BY id DESC LIMIT 1) as paidAmount,
-                cb.balance as advance_balance,
-                IFNULL(cf.active, 0) as is_credit,        -- ADDED THIS
-                IFNULL(ce.active, 0) as is_exempted      -- ADDED THIS
-            FROM students s
-            LEFT JOIN canteen_balances cb ON s.studentID = cb.studentID
-            LEFT JOIN canteen_credit_flags cf ON s.studentID = cf.studentID -- JOIN CREDIT
-            LEFT JOIN canteen_exemptions ce ON s.studentID = ce.studentID   -- JOIN EXEMPT
-            WHERE s.town = ?
-        `, [date, date, town]);
+        const students = await Student.find({ town });
+        const attendanceRecords = await Attendance.find({ date, source: 'canteen' });
+        const feeRecords = await CanteenFee.find({ date, town });
 
-        const classes = rows.reduce((acc, row) => {
-            if (!acc[row.class]) {
-                acc[row.class] = { normal: [], advanced: [], credit: [], exempted: [] };
-            }
-            
-            // DYNAMIC SORTING LOGIC
-            if (row.is_exempted === 1) {
-                acc[row.class].exempted.push(row);
-            } else if (row.is_credit === 1) {
-                acc[row.class].credit.push(row);
-            } else if (row.advance_balance > 0) {
-                acc[row.class].advanced.push(row);
-            } else {
-                acc[row.class].normal.push(row);
-            }
+        const classes = students.reduce((acc, s) => {
+            if (!acc[s.class]) acc[s.class] = { normal: [], advanced: [], credit: [], exempted: [] };
+
+            const attn = attendanceRecords.find(a => a.studentID === s.studentID);
+            const fee = feeRecords.find(f => f.studentID === s.studentID);
+
+            const sData = {
+                studentID: s.studentID, Fname: s.Fname, Lname: s.Lname, 
+                class: s.class, town: s.town,
+                attendanceStatus: attn ? attn.status : null,
+                paidAmount: fee ? fee.amount : 0,
+                advance_balance: s.advanceBalance
+            };
+
+            if (s.isExempted) acc[s.class].exempted.push(sData);
+            else if (s.isCredit) acc[s.class].credit.push(sData);
+            else if (s.advanceBalance > 0) acc[s.class].advanced.push(sData);
+            else acc[s.class].normal.push(sData);
 
             return acc;
         }, {});
 
         res.json({ success: true, data: { classes } });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ success: false, message: "Database error" });
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
-/**
- * POST /canteen/collect
- * Body: { town, date, classData: { className: { normal: [], advanced: [], credit: [], exempted: [] } }, attendance: {}, amounts: {}, collectedBy: number }
- */
-
+// ========== POST /canteen/collect ==========
 router.post('/collect', async (req, res) => {
-  const { town, date, classData, attendance, amounts, collectedBy } = req.body;
-  const finalCollectorID = collectedBy || req.body.adminID || req.body.userId;
-
-  if (!finalCollectorID) {
-    return res.status(400).json({ success: false, message: "Security Error: No Collector ID found." });
-  }
-
-  let conn;
-  try {
-    conn = await db.getConnection();
-    await conn.beginTransaction();
-
-    const [feeRow] = await conn.query('SELECT daily_fee FROM town_fees WHERE town = ?', [town]);
-    const dailyFee = Number(feeRow[0]?.daily_fee || 0);
-
-    for (const [className, categories] of Object.entries(classData)) {
-      const allStudents = [
-        ...(categories.normal || []).map(s => ({ ...s, type: 'daily' })),
-        ...(categories.advanced || []).map(s => ({ ...s, type: 'advance' })),
-        ...(categories.credit || []).map(s => ({ ...s, type: 'credit' })),
-        ...(categories.exempted || []).map(s => ({ ...s, type: 'exempt' })) // Map to 'exempt'
-      ];
-
-      for (const student of allStudents) {
-        const isPresentNow = !!attendance[student.studentID];
-        
-        // Check current status for this student on this date
-        const [existing] = await conn.query(
-          `SELECT amount, paymentType FROM canteen_fees WHERE studentID = ? AND date = ?`,
-          [student.studentID, date]
-        );
-
-        const hasExistingRecord = existing.length > 0;
-        if (hasExistingRecord && existing[0].paymentType === 'advance_topup') continue;
-
-        // --- 1. HANDLE ABSENTEES (REVERSALS) ---
-        if (!isPresentNow) {
-          if (hasExistingRecord) {
-             const prevAmount = existing[0].amount;
-             const prevType = existing[0].paymentType;
-
-             // If they were Advance or Credit, refund their exact previous amount to balance
-             if (prevType === 'advance' || prevType === 'credit') {
-                await conn.query(
-                  `UPDATE canteen_balances SET balance = balance + ? WHERE studentID = ?`,
-                  [prevAmount, student.studentID]
-                );
-             }
-             // Remove fee and attendance
-             await conn.query(`DELETE FROM canteen_fees WHERE studentID = ? AND date = ?`, [student.studentID, date]);
-             await conn.query(`DELETE FROM attendance WHERE studentID = ? AND date = ? AND source = 'canteen'`, [student.studentID, date]);
-          }
-          continue;
-        }
-
-        // --- 2. HANDLE PRESENT STUDENTS ---
-        if (isPresentNow) {
-          let finalAmount = student.type === 'exempt' ? 0 : dailyFee;
-          if (amounts && amounts[student.studentID] !== undefined) {
-            finalAmount = Number(amounts[student.studentID]);
-          }
-
-          // If new record, handle the balance deduction for Debt/Advance
-          if (!hasExistingRecord) {
-            if (student.type === 'credit' || student.type === 'advance') {
-              await conn.query(`
-                INSERT INTO canteen_balances (studentID, balance) 
-                VALUES (?, -?) 
-                ON DUPLICATE KEY UPDATE balance = balance - ?`,
-                [student.studentID, finalAmount, finalAmount]
-              );
-            }
-          }
-
-          // Upsert Attendance (CRITICAL for your reports)
-          await conn.query(`
-            INSERT INTO attendance (studentID, date, status, source)
-            VALUES (?, ?, 'present', 'canteen')
-            ON DUPLICATE KEY UPDATE status = 'present'`,
-            [student.studentID, date]
-          );
-
-          // Upsert Fees
-          await conn.query(
-            `INSERT INTO canteen_fees (studentID, amount, date, collectedBy, town, paymentType)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE 
-                amount = VALUES(amount), 
-                paymentType = VALUES(paymentType),
-                collectedBy = VALUES(collectedBy)`,
-            [student.studentID, finalAmount, date, finalCollectorID, town, student.type]
-          );
-        }
-      }
-    }
-
-    await conn.commit();
-    req.app.get('io')?.emit('refresh_data');
-    res.json({ success: true });
-
-  } catch (err) {
-    if (conn) await conn.rollback();
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (conn) conn.release();
-  }
-});
-
-
-/**
- * POST /canteen/advance/topup
- * Body: { studentID, amount }
- */
-router.post('/advance/topup', async (req, res) => {
-    // LOG 1: If you don't see this, the URL or Middleware is the problem
-    console.log(">>> [TOPUP] Incoming Request Body:", req.body);
-
-    const { studentID, amount, collectedBy, town } = req.body;
+    const { town, date, classData, attendance, amounts, collectedBy } = req.body;
+    const collectorID = collectedBy || req.body.adminID || req.body.userId;
 
     try {
-        // Ensure data exists before starting transaction
-        if (!studentID || !amount) {
-            console.log(">>> [TOPUP] Failed: Missing StudentID or Amount");
-            return res.status(400).json({ success: false, message: "Missing required fields" });
+        for (const [className, categories] of Object.entries(classData)) {
+            const allStudents = [
+                ...(categories.normal || []).map(s => ({ ...s, type: 'daily' })),
+                ...(categories.advanced || []).map(s => ({ ...s, type: 'advance' })),
+                ...(categories.credit || []).map(s => ({ ...s, type: 'credit' })),
+                ...(categories.exempted || []).map(s => ({ ...s, type: 'exempt' }))
+            ];
+
+            for (const s of allStudents) {
+                const isPresentNow = !!attendance[s.studentID];
+                
+                // 1. Handle Absentees/Reversals
+                if (!isPresentNow) {
+                    const existingFee = await CanteenFee.findOneAndDelete({ studentID: s.studentID, date });
+                    if (existingFee && (existingFee.paymentType === 'advance' || existingFee.paymentType === 'credit')) {
+                        await Student.findOneAndUpdate({ studentID: s.studentID }, { $inc: { advanceBalance: existingFee.amount } });
+                    }
+                    await Attendance.findOneAndDelete({ studentID: s.studentID, date, source: 'canteen' });
+                    continue;
+                }
+
+                // 2. Handle Present Students (Upsert)
+                let finalAmount = s.type === 'exempt' ? 0 : (amounts?.[s.studentID] || 5); // Default 5 if daily fee missing
+
+                await Attendance.findOneAndUpdate(
+                    { studentID: s.studentID, date, source: 'canteen' },
+                    { status: 'present', town },
+                    { upsert: true }
+                );
+
+                const feeUpdate = { amount: finalAmount, collectedBy: collectorID, town, paymentType: s.type };
+                const oldFee = await CanteenFee.findOneAndUpdate({ studentID: s.studentID, date }, feeUpdate, { upsert: true });
+
+                // If first time recording today and it's credit/advance, deduct from student balance
+                if (!oldFee && (s.type === 'credit' || s.type === 'advance')) {
+                    await Student.findOneAndUpdate({ studentID: s.studentID }, { $inc: { advanceBalance: -finalAmount } });
+                }
+            }
         }
-
-        await db.query('START TRANSACTION');
-
-        // 1. Update Wallet (studentID is INT, amount is DECIMAL)
-        await db.query(`
-            INSERT INTO canteen_balances (studentID, balance) 
-            VALUES (?, ?) ON DUPLICATE KEY UPDATE balance = balance + ?`,
-            [Number(studentID), Number(amount), Number(amount)]
-        );
-
-        // 2. Record Cash Entry (collectedBy is VARCHAR, date is DATETIME)
-        // We use NOW() to satisfy the unique_fee_datetime constraint
-        await db.query(`
-            INSERT INTO canteen_fees (studentID, amount, date, collectedBy, town, paymentType)
-            VALUES (?, ?, NOW(), ?, ?, 'advance_topup')`,
-            [Number(studentID), Number(amount), String(collectedBy), town]
-        );
-
-        await db.query('COMMIT');
-        console.log(">>> [TOPUP] Success for Student ID:", studentID);
+        req.app.get('io')?.emit('refresh_data');
         res.json({ success: true });
-
     } catch (err) {
-        if (db) await db.query('ROLLBACK');
-        // This log will reveal if it's a Foreign Key or Duplicate error
-        console.error(">>> [TOPUP] SQL ERROR:", err.sqlMessage || err.message);
-        res.status(500).json({ success: false, message: err.sqlMessage || 'Server Error' });
+        res.status(500).json({ success: false, error: err.message });
     }
 });
+
+// ========== POST /canteen/advance/topup ==========
+router.post('/advance/topup', async (req, res) => {
+    const { studentID, amount, collectedBy, town } = req.body;
+    try {
+        await Student.findOneAndUpdate({ studentID }, { $inc: { advanceBalance: amount } });
+        await CanteenFee.create({ studentID, amount, date: new Date(), collectedBy, town, paymentType: 'advance_topup' });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ========== POST /canteen/student/move-group ==========
+router.post('/student/move-group', async (req, res) => {
+    const { studentID, toGroup, advanceAmount } = req.body;
+    try {
+        const update = {
+            isCredit: toGroup === 'credit',
+            isExempted: toGroup === 'exempted',
+        };
+        if (toGroup === 'advanced') update.$inc = { advanceBalance: parseFloat(advanceAmount) || 0 };
+        else if (toGroup === 'normal') update.advanceBalance = 0;
+
+        await Student.findOneAndUpdate({ studentID }, update);
+        req.app.get('io')?.emit('refresh_data');
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ========== GET /canteen/students/town/:town ==========
+router.get('/students/town/:town', async (req, res) => {
+    try {
+        const filter = req.params.town === 'all' ? {} : { town: req.params.town };
+        const students = await Student.find(filter).sort({ class: 1, Fname: 1 });
+        res.json({ success: true, data: students });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+
 /**
  * POST /canteen/credit/flag
  * Body: { studentID, active: boolean }
  */
 router.post('/credit/flag', async (req, res) => {
-  const { studentID, active } = req.body;
-  if (!studentID || typeof active !== 'boolean') {
-    return res.status(400).json({ message: 'studentID and active are required' });
-  }
-  try {
-    const [row] = await db.query('SELECT studentID FROM canteen_credit_flags WHERE studentID = ?', [studentID]);
-    if (row.length) {
-      await db.query('UPDATE canteen_credit_flags SET active = ? WHERE studentID = ?', [active ? 1 : 0, studentID]);
-    } else {
-      await db.query('INSERT INTO canteen_credit_flags (studentID, active) VALUES (?, ?)', [studentID, active ? 1 : 0]);
+    const { studentID, active } = req.body;
+    if (!studentID || typeof active !== 'boolean') {
+        return res.status(400).json({ message: 'studentID and active are required' });
     }
-    res.json({ success: true });
-    const io = req.app.get('io');
-io.emit('refresh_data', { message: 'New activity detected' });
-  } catch (err) {
-    console.error('POST /credit/flag error', err);
-    res.status(500).json({ message: 'Failed to update credit flag' });
-  }
+    try {
+        // In Mongo, we just update the field on the student directly
+        await Student.findOneAndUpdate({ studentID }, { isCredit: active });
+        
+        res.json({ success: true });
+        req.app.get('io')?.emit('refresh_data', { message: 'Credit status updated' });
+    } catch (err) {
+        console.error('POST /credit/flag error', err);
+        res.status(500).json({ message: 'Failed to update credit flag' });
+    }
 });
 
 /**
@@ -251,158 +163,20 @@ io.emit('refresh_data', { message: 'New activity detected' });
  * Body: { studentID, active: boolean }
  */
 router.post('/exempt/flag', async (req, res) => {
-  const { studentID, active } = req.body;
-  if (!studentID || typeof active !== 'boolean') {
-    return res.status(400).json({ message: 'studentID and active are required' });
-  }
-  try {
-    const [row] = await db.query('SELECT studentID FROM canteen_exemptions WHERE studentID = ?', [studentID]);
-    if (row.length) {
-      await db.query('UPDATE canteen_exemptions SET active = ? WHERE studentID = ?', [active ? 1 : 0, studentID]);
-    } else {
-      await db.query('INSERT INTO canteen_exemptions (studentID, active) VALUES (?, ?)', [studentID, active ? 1 : 0]);
+    const { studentID, active } = req.body;
+    if (!studentID || typeof active !== 'boolean') {
+        return res.status(400).json({ message: 'studentID and active are required' });
     }
-    res.json({ success: true });
-    const io = req.app.get('io');
-io.emit('refresh_data', { message: 'New activity detected' });
-
-  } catch (err) {
-    console.error('POST /exempt/flag error', err);
-    res.status(500).json({ message: 'Failed to update exempt flag' });
-  }
-});
-
-
-/**
- * POST /canteen/student/move-group
- * Body: { studentID, toGroup, town, advanceAmount, date, isPresent }
- */
-router.post('/student/move-group', async (req, res) => {
-  const { studentID, toGroup, town, advanceAmount, date, isPresent } = req.body;
-  
-  // 1. Better Collector ID handling
-  const collectorID = req.body.collectedBy || req.body.teacherID || req.body.adminID || req.body.userId || 0;
-
-  const topUpAmount = parseFloat(advanceAmount) || 0;
-  const today = new Date().toLocaleDateString('en-CA'); 
-  const recordDate = date || today;
-
-  let conn;
-  try {
-    conn = await db.getConnection();
-    await conn.beginTransaction();
-
-    // 2. UPDATE ATTENDANCE
-    if (recordDate && typeof isPresent !== 'undefined') {
-      const status = isPresent ? 'present' : 'absent';
-      
-      // Fixed: Getting class from students table to ensure it exists
-      await conn.query(
-        `INSERT INTO attendance (studentID, date, status, town, source, class)
-         VALUES (?, ?, ?, ?, 'canteen', (SELECT class FROM students WHERE studentID = ? LIMIT 1))
-         ON DUPLICATE KEY UPDATE status = VALUES(status)`,
-        [studentID, recordDate, status, town, studentID]
-      );
-
-      if (!isPresent) {
-        await conn.query(
-          `DELETE FROM canteen_fees WHERE studentID = ? AND date = ?`,
-          [studentID, recordDate]
-        );
-      }
+    try {
+        // Toggle the isExempted field
+        await Student.findOneAndUpdate({ studentID }, { isExempted: active });
+        
+        res.json({ success: true });
+        req.app.get('io')?.emit('refresh_data', { message: 'Exemption status updated' });
+    } catch (err) {
+        console.error('POST /exempt/flag error', err);
+        res.status(500).json({ message: 'Failed to update exempt flag' });
     }
-
-    // 3. RESET FLAGS (MATCHED TO YOUR SQL DUMP NAMES)
-    // Note: Removed 's' from table names to match your dump (e.g. flag instead of flags)
-    await conn.query('UPDATE canteen_credit_flag SET active = 0 WHERE studentID = ?', [studentID]);
-    await conn.query('UPDATE canteen_exemption SET active = 0 WHERE studentID = ?', [studentID]);
-
-    // 4. GROUP-SPECIFIC LOGIC
-    if (toGroup === 'credit') {
-      await conn.query('UPDATE canteen_balance SET balance = 0 WHERE studentID = ?', [studentID]);
-      await conn.query('INSERT INTO canteen_credit_flag (studentID, active) VALUES (?, 1) ON DUPLICATE KEY UPDATE active = 1', [studentID]);
-
-    } else if (toGroup === 'exempted') {
-      await conn.query('UPDATE canteen_balance SET balance = 0 WHERE studentID = ?', [studentID]);
-      await conn.query('INSERT INTO canteen_exemption (studentID, active) VALUES (?, 1) ON DUPLICATE KEY UPDATE active = 1', [studentID]);
-
-    } else if (toGroup === 'advanced') {
-      // Update balance (using table name 'canteen_balance' from dump)
-      await conn.query(
-        `INSERT INTO canteen_balance (studentID, balance) 
-         VALUES (?, ?) ON DUPLICATE KEY UPDATE balance = balance + ?`,
-        [studentID, topUpAmount, topUpAmount]
-      );
-
-      // Record Revenue
-      if (topUpAmount > 0) {
-        await conn.query(
-          `INSERT INTO canteen_fees (studentID, amount, date, collectedBy, town, paymentType)
-           VALUES (?, ?, ?, ?, ?, 'advance_topup')
-           ON DUPLICATE KEY UPDATE amount = amount + VALUES(amount)`,
-          [studentID, topUpAmount, recordDate, collectorID, town]
-        );
-      }
-
-    } else if (toGroup === 'normal') {
-      await conn.query('UPDATE canteen_balance SET balance = 0 WHERE studentID = ?', [studentID]);
-    }
-
-    await conn.commit();
-
-    // 5. Emit refresh
-    const io = req.app.get('io');
-    if (io) io.emit('refresh_data', { message: 'Group change detected' });
-
-    res.json({ success: true, message: 'Student moved successfully' });
-
-  } catch (error) {
-    if (conn) await conn.rollback();
-    console.error("Move Group Error Details:", error); // This helps you see the exact SQL error
-    res.status(500).json({ success: false, message: error.sqlMessage || error.message });
-  } finally {
-    if (conn) conn.release();
-  }
-});
-/**
- * GET /canteen/students/town/:town
- * Returns all students for a specific town (for selection in modals)
- */
-router.get('/students/town/:town', async (req, res) => {
-  const { town } = req.params;
-  
-  try {
-    // JOIN with flag tables so the app knows who belongs where
-    let query = `
-      SELECT 
-        s.studentID, 
-        CONCAT(s.Fname, ' ', s.Lname) as name, 
-        s.class, 
-        s.town,
-        IFNULL(f.active, 0) as is_credit,
-        IFNULL(e.active, 0) as is_exempted,
-        IFNULL(b.balance, 0) as advance_balance
-      FROM students s
-      LEFT JOIN canteen_credit_flags f ON s.studentID = f.studentID
-      LEFT JOIN canteen_exemptions e ON s.studentID = e.studentID
-      LEFT JOIN canteen_balances b ON s.studentID = b.studentID
-    `;
-    
-    let params = [];
-    if (town !== 'all') {
-      query += ` WHERE s.town = ?`;
-      params.push(town);
-    }
-
-    query += ` ORDER BY s.class, s.Fname`;
-
-    const [students] = await db.query(query, params);
-    res.json({ success: true, data: students });
-    
-  } catch (error) {
-    console.error('Error fetching students:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch students' });
-  }
 });
 
 module.exports = router;
