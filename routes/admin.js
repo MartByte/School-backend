@@ -31,23 +31,24 @@ const generateID = async (type) => {
 // ==========================================
 
 // 1. GET students by class
-router.get('/by-town/:townName', async (req, res) => {
+router.get('/by-class/:className', async (req, res) => {
+    const { className } = req.params;
+    const today = new Date().toISOString().split('T')[0];
     try {
-        const searchTown = req.params.townName.trim(); // Remove spaces from the user input
-        
-        const students = await Student.find({ 
-            town: { $regex: new RegExp(searchTown, "i") }, 
-            isDeleted: 0 
-        }).sort({ lname: 1 });
-
-        console.log(`Searching for town: ${searchTown}. Found: ${students.length}`);
-
-        res.json(students.map(s => ({ 
-            studentID: s.studentID, 
-            fullName: `${s.fname} ${s.lname}`,
-            town: s.town, 
-            class: s.class 
-        })));
+        const students = await Student.find({ class: className, isDeleted: false }).sort({ Lname: 1 });
+        const rows = await Promise.all(students.map(async (s) => {
+            const attn = await Attendance.findOne({ studentID: s.studentID, date: today, source: 'class' });
+            const fee = await CanteenFee.findOne({ studentID: s.studentID, date: today });
+            return {
+                studentID: s.studentID,
+                fullName: `${s.Fname} ${s.Lname}`,
+                town: s.town,
+                class: s.class,
+                attendanceStatus: attn ? attn.status : null,
+                paymentStatus: fee ? 'Paid' : 'Unpaid'
+            };
+        }));
+        res.json(rows);
     } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -68,19 +69,25 @@ router.post('/students/add', upload.single('profilePic'), async (req, res) => {
 // 3. GET students by town
 router.get('/by-town/:townName', async (req, res) => {
     try {
-        // The 'i' flag makes the search case-insensitive
-        const students = await Student.find({ 
-            town: { $regex: new RegExp(req.params.townName, "i") }, 
-            isDeleted: 0 
-        }).sort({ Lname: 1 });
+        let town = req.params.townName;
 
-        res.json(students.map(s => ({ 
-            studentID: s.studentID, 
-            fullName: `${s.fname} ${s.lname}`, // Ensure these match your schema's casing
-            town: s.town, 
-            class: s.class 
-        })));
-    } catch (err) { res.status(500).json({ message: err.message }); }
+        // If the frontend accidentally sends the literal placeholder
+        if (!town || town === ":townName") {
+            console.log("⚠️ Received invalid town placeholder");
+            return res.json([]); 
+        }
+
+        // Use the Student model we fixed with Number types
+        const students = await Student.find({ 
+            town: { $regex: new RegExp(town.trim(), "i") }, 
+            isDeleted: 0 
+        }).sort({ lname: 1 });
+
+        console.log(`✅ Found ${students.length} students in ${town}`);
+        res.json(students);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
 });
 
 // 4. GET all students
