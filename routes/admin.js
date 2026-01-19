@@ -31,24 +31,23 @@ const generateID = async (type) => {
 // ==========================================
 
 // 1. GET students by class
-router.get('/by-class/:className', async (req, res) => {
-    const { className } = req.params;
-    const today = new Date().toISOString().split('T')[0];
+router.get('/by-town/:townName', async (req, res) => {
     try {
-        const students = await Student.find({ class: className, isDeleted: false }).sort({ Lname: 1 });
-        const rows = await Promise.all(students.map(async (s) => {
-            const attn = await Attendance.findOne({ studentID: s.studentID, date: today, source: 'class' });
-            const fee = await CanteenFee.findOne({ studentID: s.studentID, date: today });
-            return {
-                studentID: s.studentID,
-                fullName: `${s.Fname} ${s.Lname}`,
-                town: s.town,
-                class: s.class,
-                attendanceStatus: attn ? attn.status : null,
-                paymentStatus: fee ? 'Paid' : 'Unpaid'
-            };
-        }));
-        res.json(rows);
+        const searchTown = req.params.townName.trim(); // Remove spaces from the user input
+        
+        const students = await Student.find({ 
+            town: { $regex: new RegExp(searchTown, "i") }, 
+            isDeleted: 0 
+        }).sort({ lname: 1 });
+
+        console.log(`Searching for town: ${searchTown}. Found: ${students.length}`);
+
+        res.json(students.map(s => ({ 
+            studentID: s.studentID, 
+            fullName: `${s.fname} ${s.lname}`,
+            town: s.town, 
+            class: s.class 
+        })));
     } catch (err) { res.status(500).json({ message: err.message }); }
 });
 

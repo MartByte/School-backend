@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 const StudentSchema = new mongoose.Schema({
-    studentID: { type: String, required: true, unique: true },
+    studentID: { type: Number, required: true, unique: true },
     fname: { type: String, required: true },
     mname: { type: String },
     lname: { type: String, required: true },
@@ -18,4 +18,4 @@ const StudentSchema = new mongoose.Schema({
     isDeleted: { type: Number, default: 0 }
 }, { timestamps: true });
 
-module.exports = mongoose.model('Student', StudentSchema);
+module.exports = mongoose.model('Student', StudentSchema, 'students');
