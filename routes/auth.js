@@ -44,15 +44,30 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
     const { id, passwordHash } = req.body; 
     try {
-        const dbUser = await Teacher.findOne({ teacherID: id }) || await Admin.findOne({ adminID: id });
-        if (!dbUser) return res.status(404).json({ success: false, message: 'User not found' });
+        // 1. Convert id to Number to match Atlas data type
+        const numericId = Number(id);
+
+        // 2. Search both collections with the numeric ID
+        const dbUser = await Teacher.findOne({ teacherID: numericId }) || 
+                       await Admin.findOne({ adminID: numericId });
+
+        if (!dbUser) {
+            console.log(`Login failed: ID ${id} not found in Teachers or Admins`);
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
 
         const role = dbUser.teacherID ? 'teacher' : 'admin';
 
+        // 3. Use lowercase keys (fname, lname) to match your Atlas documents
         if (!dbUser.passwordHash) {
             return res.status(200).json({ 
                 success: false, 
-                data: { requireRegistration: true, id, role, fullName: `${dbUser.Fname} ${dbUser.Lname}` }
+                data: { 
+                    requireRegistration: true, 
+                    id, 
+                    role, 
+                    fullName: `${dbUser.fname} ${dbUser.lname}` // Changed to lowercase
+                }
             });
         }
 
@@ -63,38 +78,23 @@ router.post('/login', async (req, res) => {
 
         res.status(200).json({
             success: true,
-            data: { token, user: { id, role, Fname: dbUser.Fname, Lname: dbUser.Lname, town: dbUser.town } }
+            data: { 
+                token, 
+                user: { 
+                    id, 
+                    role, 
+                    Fname: dbUser.fname, // Mapping db lowercase to app uppercase
+                    Lname: dbUser.lname, 
+                    town: dbUser.town 
+                } 
+            }
         });
     } catch (err) {
+        console.error("Login Error:", err);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
 
-// ========== TEACHER DASHBOARD INFO ==========
-router.get('/teacher/:id', async (req, res) => {
-    try {
-        const teacher = await Teacher.findOne({ teacherID: req.params.id });
-        if (!teacher) return res.status(404).json({ message: 'Teacher not found' });
-
-        // Handle profile picture URL logic
-        let profilePicUrl = null;
-        if (teacher.profilePic) {
-            const fileName = teacher.profilePic.split('/').pop();
-            profilePicUrl = `${API_BASE_URL}/uploads/${fileName}`;
-        }
-
-        res.status(200).json({
-            Fname: teacher.Fname || '',
-            Lname: teacher.Lname || '',
-            town: teacher.town || null,
-            assignedClass: teacher.assignedClass || null,
-            isCanteenCollector: teacher.isCanteenCollector || false,
-            profilePicUrl
-        });
-    } catch (err) {
-        res.status(500).json({ message: 'Internal server error' });
-    }
-});
 
 // ========== REQUEST PASSWORD RESET ==========
 router.post('/request-password-reset', async (req, res) => {
