@@ -12,10 +12,10 @@ const StudentSchema = new mongoose.Schema({
     
     // Financial fields (previously separate SQL tables)
     advanceBalance: { type: Number, default: 0 }, 
-    isCredit: { type: Boolean, default: false },
-    isExempted: { type: Boolean, default: false },
+    isCredit: { type: Number, default: 0 },
+    isExempted: { type: Number, default: 0 },
     
-    isDeleted: { type: Boolean, default: false }
+    isDeleted: { type: Number, default: 0 }
 }, { timestamps: true });
 
 module.exports = mongoose.model('Student', StudentSchema);
