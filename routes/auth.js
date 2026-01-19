@@ -44,21 +44,20 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
     const { id, passwordHash } = req.body; 
     try {
-        // 1. Convert id to Number to match Atlas data type
         const numericId = Number(id);
 
-        // 2. Search both collections with the numeric ID
+        // NOTICE: Changed adminID to adminId to match your JSON
         const dbUser = await Teacher.findOne({ teacherID: numericId }) || 
-                       await Admin.findOne({ adminID: numericId });
+                       await Admin.findOne({ adminId: numericId });
 
         if (!dbUser) {
-            console.log(`Login failed: ID ${id} not found in Teachers or Admins`);
+            console.log(`Login failed: ID ${id} not found.`);
             return res.status(404).json({ success: false, message: 'User not found' });
         }
 
-        const role = dbUser.teacherID ? 'teacher' : 'admin';
+        // Check role based on which field exists
+        const role = dbUser.adminId ? 'admin' : 'teacher';
 
-        // 3. Use lowercase keys (fname, lname) to match your Atlas documents
         if (!dbUser.passwordHash) {
             return res.status(200).json({ 
                 success: false, 
@@ -66,7 +65,7 @@ router.post('/login', async (req, res) => {
                     requireRegistration: true, 
                     id, 
                     role, 
-                    fullName: `${dbUser.fname} ${dbUser.lname}` // Changed to lowercase
+                    fullName: `${dbUser.fname} ${dbUser.lname}` 
                 }
             });
         }
@@ -83,14 +82,12 @@ router.post('/login', async (req, res) => {
                 user: { 
                     id, 
                     role, 
-                    Fname: dbUser.fname, // Mapping db lowercase to app uppercase
-                    Lname: dbUser.lname, 
-                    town: dbUser.town 
+                    Fname: dbUser.fname, 
+                    Lname: dbUser.lname 
                 } 
             }
         });
     } catch (err) {
-        console.error("Login Error:", err);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });

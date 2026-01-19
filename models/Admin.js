@@ -1,8 +1,9 @@
 const mongoose = require('mongoose');
 
 const AdminSchema = new mongoose.Schema({
-    adminID: {
-        type: String,
+    // 1. Matches "adminId": 105890 in Atlas
+    adminId: {
+        type: Number, 
         required: true,
         unique: true
     },
@@ -16,14 +17,15 @@ const AdminSchema = new mongoose.Schema({
         required: true,
         trim: true
     },
+    // 2. Note: Your Atlas JSON didn't show an email, 
+    // but keeping it if you plan to add it later.
     email: {
         type: String,
-        required: true,
-        unique: true,
         lowercase: true,
         trim: true
     },
-    password: {
+    // 3. Matches "passwordHash" in Atlas
+    passwordHash: {
         type: String,
         required: true
     },
@@ -35,10 +37,12 @@ const AdminSchema = new mongoose.Schema({
         type: String,
         trim: true
     },
+    // 4. Matches "isDeleted": 0 in Atlas
     isDeleted: {
-        type: Boolean,
-        default: false
+        type: Number,
+        default: 0
     }
 }, { timestamps: true });
 
-module.exports = mongoose.model('Admin', AdminSchema);
+// 5. Force collection name to 'admins' (ensure this matches Atlas collection name)
+module.exports = mongoose.model('Admin', AdminSchema, 'admins');
