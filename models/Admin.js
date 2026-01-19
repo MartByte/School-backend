@@ -6,12 +6,12 @@ const AdminSchema = new mongoose.Schema({
         required: true,
         unique: true
     },
-    Fname: {
+    fname: {
         type: String,
         required: true,
         trim: true
     },
-    Lname: {
+    lname: {
         type: String,
         required: true,
         trim: true

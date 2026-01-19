@@ -69,25 +69,43 @@ router.post('/students/add', upload.single('profilePic'), async (req, res) => {
 // 3. GET students by town
 router.get('/by-town/:townName', async (req, res) => {
     try {
-        const students = await Student.find({ town: req.params.townName, isDeleted: false }).sort({ Lname: 1 });
-        res.json(students.map(s => ({ studentID: s.studentID, fullName: `${s.Fname} ${s.Lname}`, town: s.town, class: s.class })));
+        // The 'i' flag makes the search case-insensitive
+        const students = await Student.find({ 
+            town: { $regex: new RegExp(req.params.townName, "i") }, 
+            isDeleted: false 
+        }).sort({ Lname: 1 });
+
+        res.json(students.map(s => ({ 
+            studentID: s.studentID, 
+            fullName: `${s.fname} ${s.lname}`, // Ensure these match your schema's casing
+            town: s.town, 
+            class: s.class 
+        })));
     } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // 4. GET all students
 router.get('/students/all', async (req, res) => {
     try {
-        const students = await Student.find().sort({ Lname: 1 });
+        const students = await Student.find().sort({ lname: 1 });
         res.json(students);
     } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // 5. PUT edit student
-router.put('/students/edit/:studentID', async (req, res) => {
+router.get('/all/teachers', async (req, res) => {
     try {
-        await Student.findOneAndUpdate({ studentID: req.params.studentID }, req.body);
-        res.json({ message: 'Student updated' });
-    } catch (err) { res.status(500).json({ message: 'Update failed' }); }
+        console.log("Searching for teachers in database:", mongoose.connection.name);
+        
+        // Match the database reality: isDeleted is 0 (Number), not false (Boolean)
+        const teachers = await Teacher.find({ isDeleted: 0 }); 
+        
+        console.log(`Found ${teachers.length} teachers`);
+        res.json(teachers);
+    } catch (err) {
+        console.error("Teacher Route Error:", err.message);
+        res.status(500).json({ message: err.message });
+    }
 });
 
 // ==========================================
@@ -97,10 +115,42 @@ router.put('/students/edit/:studentID', async (req, res) => {
 // 6. GET all teachers
 router.get('/all/teachers', async (req, res) => {
     try {
-        const teachers = await Teacher.find({ isDeleted: false }).sort({ Lname: 1 });
-        res.json(teachers.map(t => ({ ...t._doc, fullName: `${t.Fname} ${t.Lname}` })));
-    } catch (err) { res.status(500).json({ message: err.message }); }
+        // Change false to 0 to match the migrated SQL data
+        const teachers = await Teacher.find({ isDeleted: 0 }).sort({ lname: 1 });
+        
+        // Match the lowercase keys in your .map()
+        res.json(teachers.map(t => ({ 
+            ...t._doc, 
+            fullName: `${t.fname} ${t.mname ? t.mname + ' ' : ''}${t.lname}` 
+        })));
+    } catch (err) { 
+        res.status(500).json({ message: err.message }); 
+    }
 });
+
+
+
+router.get('/debug-db', async (req, res) => {
+    try {
+        const db = mongoose.connection.db;
+        // This gets the names of ALL collections in SchoolDB
+        const collections = await db.listCollections().toArray();
+        const collectionNames = collections.map(c => c.name);
+
+        // This checks the raw count of 'teachers' without any Mongoose schema logic
+        const rawCount = await db.collection('teachers').countDocuments();
+
+        res.json({
+            connectedTo: mongoose.connection.name,
+            availableCollections: collectionNames,
+            rawTeacherCount: rawCount
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
 
 // 7. POST add teacher
 router.post('/add-teacher', upload.single('profilePic'), async (req, res) => {
