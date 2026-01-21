@@ -47,7 +47,7 @@ router.post('/login', async (req, res) => {
         const numericId = Number(id);
 
         // NOTICE: Changed adminID to adminId to match your JSON
-        const dbUser = await Teacher.findOne({ teacherID: numericId }) || 
+        const dbUser = await Teacher.findOne({ teacherId: numericId }) || 
                        await Admin.findOne({ adminId: numericId });
 
         if (!dbUser) {

@@ -3,34 +3,49 @@ const router = express.Router();
 const Student = require('../models/Student');
 const Attendance = require('../models/Attendance');
 const CanteenFee = require('../models/CanteenFee');
+const CanteenBalance = require('../models/CanteenBalance');
+const CanteenCreditFlag = require('../models/CanteenCreditFlag');
+const CanteenExemption = require('../models/CanteenExemption');
 
 // ========== GET /canteen/collect ==========
 router.get('/collect', async (req, res) => {
     const { town, date } = req.query;
-    if (!town || !date) return res.status(400).json({ success: false, message: "Missing data" });
-
     try {
+        // 1. Fetch EVERYTHING from Atlas
         const students = await Student.find({ town });
         const attendanceRecords = await Attendance.find({ date, source: 'canteen' });
         const feeRecords = await CanteenFee.find({ date, town });
+        
+        // Fetch your separate collections
+        const balances = await CanteenBalance.find({});
+        const creditFlags = await CanteenCreditFlag.find({ active: 1 });
+        const exemptions = await CanteenExemption.find({ active: 1 });
 
         const classes = students.reduce((acc, s) => {
             if (!acc[s.class]) acc[s.class] = { normal: [], advanced: [], credit: [], exempted: [] };
 
+            // 2. "JOIN" the data manually using studentID
             const attn = attendanceRecords.find(a => a.studentID === s.studentID);
             const fee = feeRecords.find(f => f.studentID === s.studentID);
+            
+            const sBalance = balances.find(b => b.studentID === s.studentID);
+            const isCredit = creditFlags.find(c => c.studentID === s.studentID);
+            const isExempt = exemptions.find(e => e.studentID === s.studentID);
 
             const sData = {
-                studentID: s.studentID, Fname: s.Fname, Lname: s.Lname, 
-                class: s.class, town: s.town,
+                studentID: s.studentID, 
+                Fname: s.fname || s.Fname, // Fixes "undefined"
+                Lname: s.lname || s.Lname, 
+                class: s.class,
                 attendanceStatus: attn ? attn.status : null,
                 paidAmount: fee ? fee.amount : 0,
-                advance_balance: s.advanceBalance
+                advance_balance: sBalance ? sBalance.balance : 0
             };
 
-            if (s.isExempted) acc[s.class].exempted.push(sData);
-            else if (s.isCredit) acc[s.class].credit.push(sData);
-            else if (s.advanceBalance > 0) acc[s.class].advanced.push(sData);
+            // 3. Grouping Logic
+            if (isExempt) acc[s.class].exempted.push(sData);
+            else if (isCredit) acc[s.class].credit.push(sData);
+            else if (sData.advance_balance > 0) acc[s.class].advanced.push(sData);
             else acc[s.class].normal.push(sData);
 
             return acc;
@@ -59,19 +74,25 @@ router.post('/collect', async (req, res) => {
             for (const s of allStudents) {
                 const isPresentNow = !!attendance[s.studentID];
                 
-                // 1. Handle Absentees/Reversals
+                // 1. HANDLE ABSENTEES (Reversing payments)
                 if (!isPresentNow) {
                     const existingFee = await CanteenFee.findOneAndDelete({ studentID: s.studentID, date });
+                    
+                    // If they were advance/credit, REFUND the balance collection
                     if (existingFee && (existingFee.paymentType === 'advance' || existingFee.paymentType === 'credit')) {
-                        await Student.findOneAndUpdate({ studentID: s.studentID }, { $inc: { advanceBalance: existingFee.amount } });
+                        await CanteenBalance.findOneAndUpdate(
+                            { studentID: s.studentID }, 
+                            { $inc: { balance: existingFee.amount } } // Refunding 'balance' field
+                        );
                     }
                     await Attendance.findOneAndDelete({ studentID: s.studentID, date, source: 'canteen' });
                     continue;
                 }
 
-                // 2. Handle Present Students (Upsert)
-                let finalAmount = s.type === 'exempt' ? 0 : (amounts?.[s.studentID] || 5); // Default 5 if daily fee missing
+                // 2. HANDLE PRESENT STUDENTS
+                let finalAmount = s.type === 'exempt' ? 0 : (amounts?.[s.studentID] || 5); 
 
+                // Upsert Attendance
                 await Attendance.findOneAndUpdate(
                     { studentID: s.studentID, date, source: 'canteen' },
                     { status: 'present', town },
@@ -79,17 +100,33 @@ router.post('/collect', async (req, res) => {
                 );
 
                 const feeUpdate = { amount: finalAmount, collectedBy: collectorID, town, paymentType: s.type };
-                const oldFee = await CanteenFee.findOneAndUpdate({ studentID: s.studentID, date }, feeUpdate, { upsert: true });
+                
+                // Try to find if a fee was already recorded today
+                const oldFee = await CanteenFee.findOneAndUpdate(
+                    { studentID: s.studentID, date }, 
+                    feeUpdate, 
+                    { upsert: false } // We don't upsert yet because we need to know if it existed
+                );
 
-                // If first time recording today and it's credit/advance, deduct from student balance
-                if (!oldFee && (s.type === 'credit' || s.type === 'advance')) {
-                    await Student.findOneAndUpdate({ studentID: s.studentID }, { $inc: { advanceBalance: -finalAmount } });
+                // 3. BALANCE DEDUCTION (Matches SQL logic)
+                if (!oldFee) {
+                    // This is a NEW collection for today
+                    if (s.type === 'credit' || s.type === 'advance') {
+                        await CanteenBalance.findOneAndUpdate(
+                            { studentID: s.studentID }, 
+                            { $inc: { balance: -finalAmount } }, // Deducting from balance collection
+                            { upsert: true } // Creates record if it doesn't exist
+                        );
+                    }
+                    // Now create the fee record since it didn't exist
+                    await CanteenFee.create({ studentID: s.studentID, date, ...feeUpdate });
                 }
             }
         }
         req.app.get('io')?.emit('refresh_data');
         res.json({ success: true });
     } catch (err) {
+        console.error("POST Collect Error:", err);
         res.status(500).json({ success: false, error: err.message });
     }
 });
