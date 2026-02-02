@@ -1,8 +1,0 @@
-const mongoose = require('mongoose');
-
-const CanteenCreditFlagSchema = new mongoose.Schema({
-    studentID: { type: Number, required: true },
-    active: { type: Number, default: 0 } // SQL used 1 or 0
-});
-
-module.exports = mongoose.model('CanteenCreditFlag', CanteenCreditFlagSchema, 'canteen_credit_flags');

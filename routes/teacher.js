@@ -1,38 +1,31 @@
 const express = require('express');
 const router = express.Router();
-const Student = require('../models/Student');
-const Attendance = require('../models/Attendance');
-const Teacher = require('../models/Teacher');
+const db = require('../db/connection');
 
-/**
- * GET: Fetch students' attendance for a class on a given date
- */
+
 router.get('/student-attendance/:className/:date', async (req, res) => {
     const { className, date } = req.params;
 
     try {
-        // 1. Get all students in that class
-        const students = await Student.find({ class: className }).sort({ Fname: 1, Lname: 1 });
+        // Get all students in that class and check if they have an attendance record for that date
+        const [rows] = await db.query(`
+            SELECT 
+                s.studentID,
+                s.Fname,
+                s.Mname,
+                s.Lname,
+                s.class,
+                s.town,
+                a.status AS attendanceStatus
+            FROM students s
+            LEFT JOIN attendance a 
+                ON s.studentID = a.studentID 
+                AND a.date = ?
+                AND a.source = 'class'
+            WHERE s.class = ?
+            ORDER BY s.Fname, s.Lname
+        `, [date, className]);
 
-        // 2. Get attendance records for that specific date and class source
-        const attendanceRecords = await Attendance.find({ 
-            date: date, 
-            source: 'class' 
-        });
-
-        // 3. Map students to their attendance status (Replacing the SQL LEFT JOIN)
-        const rows = students.map(s => {
-            const record = attendanceRecords.find(a => a.studentID === s.studentID);
-            return {
-                studentID: s.studentID,
-                Fname: s.Fname,
-                Mname: s.Mname,
-                Lname: s.Lname,
-                class: s.class,
-                town: s.town,
-                attendanceStatus: record ? record.status : null
-            };
-        });
 
         res.json(rows);
     } catch (err) {
@@ -41,136 +34,176 @@ router.get('/student-attendance/:className/:date', async (req, res) => {
     }
 });
 
+
 /**
- * POST: Mark student attendance
+ * POST: Mark student attendance (for class attendance)
  */
 router.post('/student-attendance', async (req, res) => {
+    console.log("DEBUG: Received Body ->", req.body);
+
     const { studentID, teacherID, adminID, date, status, source } = req.body;
     const classVal = req.body.class;
 
-    if (!studentID || !classVal || !date || !status || (!teacherID && !adminID)) {
-        return res.status(400).json({ success: false, message: 'Missing required fields' });
+    // PROFESSIONAL VALIDATION: 
+    // We need studentID, class, date, and status.
+    // BUT, we only need EITHER teacherID OR adminID.
+    const missingFields = [];
+    if (!studentID) missingFields.push("studentID");
+    if (!classVal) missingFields.push("class");
+    if (!date) missingFields.push("date");
+    if (!status) missingFields.push("status");
+    
+    // Check if both are missing
+    if (!teacherID && !adminID) {
+        missingFields.push("Authorized User ID (Teacher or Admin)");
+    }
+
+    if (missingFields.length > 0) {
+        return res.status(400).json({
+            success: false,
+            message: `Missing fields: ${missingFields.join(', ')}`
+        });
     }
 
     try {
         const finalSource = source || 'class';
 
-        // Mongoose "findOneAndUpdate" with "upsert: true" replaces "INSERT ... ON DUPLICATE KEY UPDATE"
-        await Attendance.findOneAndUpdate(
-            { studentID, date, source: finalSource },
-            { 
+        // We use COALESCE or simple logic to ensure we don't break the INT requirement
+        // If teacherID is null, the DB will store NULL (if you modified the column to be nullable)
+        await db.query(
+            `INSERT INTO attendance (studentID, teacherID, adminID, class, date, status, source) 
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE 
+                status = VALUES(status), 
+                teacherID = VALUES(teacherID),
+                adminID = VALUES(adminID),
+                class = VALUES(class)`, 
+            [
+                studentID, 
+                teacherID || null, // Professional: Use NULL if not provided
+                adminID || null,   // Professional: Track the admin separately
+                classVal, 
+                date, 
                 status, 
-                teacherID: teacherID || null, 
-                adminID: adminID || null, 
-                class: classVal 
-            },
-            { upsert: true, new: true }
+                finalSource
+            ]
         );
 
+        // Real-time update
         const io = req.app.get('io');
         if (io) io.emit('refresh_data', { type: 'attendance_update', studentID });
 
         res.json({ success: true, message: 'Attendance recorded successfully' });
     } catch (err) {
-        console.error("Attendance POST Error:", err);
+        console.error("SQL ERROR:", err);
         res.status(500).json({ success: false, message: "Internal Server Error" });
     }
 });
 
 /**
- * GET: Distinct classes
+ *  GET: Distinct classes
  */
 router.get('/classes', async (req, res) => {
     try {
-        const classes = await Student.distinct('class', { class: { $ne: null, $ne: '' } });
-        res.json(classes.sort());
+        const [rows] = await db.query(`SELECT DISTINCT class FROM students WHERE class IS NOT NULL AND class != '' ORDER BY class`);
+        res.json(rows.map(r => r.class));
     } catch (err) {
+        console.error('Error fetching classes:', err);
         res.status(500).json({ message: 'Failed to fetch classes' });
     }
+    
 });
 
 /**
- * POST: Students by class and town
+ * 📌 POST: Students by class and town
+ * body: { town, class }
  */
 router.post('/students/by-class-town', async (req, res) => {
     const { town, class: className } = req.body;
+    if (!town || !className) {
+        return res.status(400).json({ message: 'Missing town or class' });
+    }
     try {
-        const students = await Student.find({ town, class: className }).sort({ Lname: 1, Fname: 1 });
-        req.app.get('io')?.emit('refresh_data', { message: 'New activity detected' });
-        res.json(students);
+        const [rows] = await db.query(
+            `SELECT studentID, Fname, Mname, Lname, class, town
+             FROM students
+             WHERE town = ? AND class = ?
+             ORDER BY Lname, Fname`,
+            [town, className]
+        );
+        const io = req.app.get('io');
+io.emit('refresh_data', { message: 'New activity detected' });
+        res.json(rows);
     } catch (err) {
+        console.error('Error fetching students by class and town:', err);
         res.status(500).json({ message: 'Failed to fetch students' });
     }
 });
 
 /**
- * GET: Distinct towns
+ * 📌 GET: Distinct towns
  */
 router.get('/towns', async (req, res) => {
     try {
-        const towns = await Student.distinct('town', { town: { $ne: null, $ne: '' } });
-        res.json(towns.sort());
+        const [rows] = await db.query(`SELECT DISTINCT town FROM students WHERE town IS NOT NULL AND town != '' ORDER BY town`);
+        res.json(rows.map(r => r.town));
     } catch (err) {
+        console.error('Error fetching towns:', err);
         res.status(500).json({ message: 'Failed to fetch towns' });
     }
 });
 
 /**
- * GET: Teacher information
+ * 📌 GET: Teacher information
+ * /api/teacher/:id/info
  */
 router.get('/teacher/:id/info', async (req, res) => {
+    const { id } = req.params;
     try {
-        const teacher = await Teacher.findOne({ teacherID: req.params.id, isDeleted: false });
-        if (!teacher) return res.status(404).json({ message: 'Teacher not found' });
-        res.json(teacher);
+        const [rows] = await db.query(
+            'SELECT teacherID, Fname, Mname, Lname, phone, role, town, assignedClass, isCanteenCollector FROM teachers WHERE teacherID = ? AND isDeleted = 0',
+            [id]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ message: 'Teacher not found' });
+        }
+        res.json(rows[0]);
     } catch (err) {
+        console.error('Error fetching teacher info:', err);
         res.status(500).json({ message: 'Failed to fetch teacher info' });
     }
 });
 
-
-
 /**
- * GET: Teacher class attendance records (History)
+ * 📌 GET: Teacher class attendance records
  * /api/teacher/:id/attendance?start=YYYY-MM-DD&end=YYYY-MM-DD
  */
 router.get('/teacher/:id/attendance', async (req, res) => {
     const { id } = req.params;
     const { start, end } = req.query;
-
     try {
-        // 1. Find teacher's assigned class
-        const teacher = await Teacher.findOne({ teacherID: id });
-        if (!teacher) return res.status(404).json({ message: 'Teacher not found' });
-        
-        const assignedClass = teacher.assignedClass;
+        // Find teacher assigned class
+        const [trows] = await db.query('SELECT assignedClass FROM teachers WHERE teacherID = ?', [id]);
+        if (trows.length === 0) return res.status(404).json({ message: 'Teacher not found' });
+        const assignedClass = trows[0].assignedClass;
         if (!assignedClass) return res.json([]);
 
-        // 2. Build the query filter
-        let query = { class: assignedClass };
-
-        // Handle date range if provided
+        let sql = `
+            SELECT a.date, a.studentID, a.status,
+                   CONCAT(s.Fname, ' ', COALESCE(s.Mname,''), ' ', s.Lname) AS fullName,
+                   s.class, s.town
+            FROM attendance a
+            JOIN students s ON s.studentID = a.studentID
+            WHERE s.class = ?`;
+        const params = [assignedClass];
         if (start && end) {
-            query.date = { $gte: start, $lte: end };
+            sql += ' AND a.date BETWEEN ? AND ?';
+            params.push(start, end);
         }
+        sql += ' ORDER BY a.date DESC, s.Lname, s.Fname';
 
-        // 3. Fetch attendance and manually "Join" student names
-        const attendanceRecords = await Attendance.find(query).sort({ date: -1 });
-        
-        // 4. Enrich records with student names
-        const enrichedRecords = await Promise.all(attendanceRecords.map(async (record) => {
-            const student = await Student.findOne({ studentID: record.studentID });
-            return {
-                date: record.date,
-                studentID: record.studentID,
-                status: record.status,
-                fullName: student ? `${student.Fname} ${student.Mname || ''} ${student.Lname}` : 'Unknown Student',
-                class: assignedClass,
-                town: student ? student.town : ''
-            };
-        }));
-
-        res.json(enrichedRecords);
+        const [rows] = await db.query(sql, params);
+        res.json(rows);
     } catch (err) {
         console.error('Error fetching teacher attendance records:', err);
         res.status(500).json({ message: 'Failed to fetch attendance records' });
