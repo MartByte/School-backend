@@ -110,6 +110,36 @@ router.put('/students/edit/:studentID', async (req, res) => {
     }
 });
 
+// DELETE endpoint for Soft Delete
+router.delete('/students/delete/:studentId', (req, res) => {
+    const { studentId } = req.params;
+
+    // Use a Soft Delete query
+    const sql = "UPDATE students SET isDeleted = 1 WHERE studentID = ?";
+
+    db.query(sql, [studentId], (err, result) => {
+        if (err) {
+            console.error("Database Error:", err);
+            return res.status(500).json({ 
+                success: false, 
+                message: "Database error occurred during deletion." 
+            });
+        }
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                message: "Student not found." 
+            });
+        }
+
+        res.json({ 
+            success: true, 
+            message: "Student marked as deleted successfully." 
+        });
+    });
+});
+
 // ==========================================
 // 2. TEACHER MANAGEMENT
 // ==========================================
@@ -249,6 +279,58 @@ router.post('/teachers/attendance', async (req, res) => {
     } finally {
         connection.release();
     }
+});
+
+// Soft delete teacher
+router.delete('/delete-teacher/:teacherId', (req, res) => {
+    const { teacherId } = req.params;
+    const sql = "UPDATE teachers SET isDeleted = 1 WHERE teacherID = ?";
+
+    db.query(sql, [teacherId], (err, result) => {
+        if (err) return res.status(500).json({ success: false, error: err.message });
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: "Teacher not found" });
+        }
+
+        res.json({ success: true, message: "Teacher deleted successfully" });
+    });
+});
+
+// PUT endpoint to edit teacher details
+router.put('/teachers/edit/:teacherId', (req, res) => {
+    const { teacherId } = req.params;
+    const updateData = req.body;
+
+    // Filter out fields that shouldn't be updated directly or are empty
+    const fieldsToUpdate = Object.keys(updateData).filter(key => 
+        ['Fname', 'Mname', 'Lname', 'email', 'phone', 'assignedClass', 'town', 'isCanteenCollector', 'role'].includes(key)
+    );
+
+    if (fieldsToUpdate.length === 0) {
+        return res.status(400).json({ success: false, message: "No valid fields provided for update." });
+    }
+
+    const setClause = fieldsToUpdate.map(key => `${key} = ?`).join(', ');
+    const values = fieldsToUpdate.map(key => updateData[key]);
+    
+    // Add teacherId to the end of the values array for the WHERE clause
+    values.push(teacherId);
+
+    const sql = `UPDATE teachers SET ${setClause} WHERE teacherID = ? AND isDeleted = 0`;
+
+    db.query(sql, values, (err, result) => {
+        if (err) {
+            console.error("Database Error:", err);
+            return res.status(500).json({ success: false, message: "Internal server error" });
+        }
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: "Teacher not found or already deleted." });
+        }
+
+        res.json({ success: true, message: "Teacher updated successfully" });
+    });
 });
 
 // ==========================================
