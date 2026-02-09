@@ -9,56 +9,54 @@ const db = require('../db/connection');
 
 
 router.get('/collect', async (req, res) => {
-      const { town, date } = req.query;
+    const { town, date } = req.query;
 
-      if (!town || !date) {
-            return res.status(400).json({ success: false, message: "Town and date are required." });
-      }
+    if (!town || !date) {
+        return res.status(400).json({ success: false, message: "Town and date are required." });
+    }
 
-      try {
-            const [rows] = await db.query(`
-                  SELECT
-                        s.studentID, s.Fname, s.Lname, s.class, s.town,
-                        (SELECT status FROM attendance
-                          WHERE studentID = s.studentID AND date = ?
-                          ORDER BY id DESC LIMIT 1) as attendanceStatus,
-                        (SELECT amount FROM canteen_fees
-                          WHERE studentID = s.studentID AND date = ?
-                          ORDER BY id DESC LIMIT 1) as paidAmount,
-                        cb.balance as advance_balance,
-                        IFNULL(cf.active, 0) as is_credit,            -- ADDED THIS
-                        IFNULL(ce.active, 0) as is_exempted         -- ADDED THIS
-                  FROM students s
-                  LEFT JOIN canteen_balances cb ON s.studentID = cb.studentID
-                  LEFT JOIN canteen_credit_flags cf ON s.studentID = cf.studentID -- JOIN CREDIT
-                  LEFT JOIN canteen_exemptions ce ON s.studentID = ce.studentID    -- JOIN EXEMPT
-                  WHERE s.town = ?
-            `, [date, date, town]);
+    try {
+        const [rows] = await db.query(`
+            SELECT 
+                s.studentID, s.Fname, s.Lname, s.class, s.town,
+                a.status as attendanceStatus,
+                cf.amount as paidAmount,
+                cf.paymentType as lastPaymentType,
+                cb.balance as advance_balance,
+                IFNULL(c_flag.active, 0) as is_credit,
+                IFNULL(ce.active, 0) as is_exempted
+            FROM students s
+            LEFT JOIN attendance a ON s.studentID = a.studentID AND a.date = ? AND a.source = 'canteen'
+            LEFT JOIN canteen_fees cf ON s.studentID = cf.studentID AND cf.date = ?
+            LEFT JOIN canteen_balances cb ON s.studentID = cb.studentID
+            LEFT JOIN canteen_credit_flags c_flag ON s.studentID = c_flag.studentID
+            LEFT JOIN canteen_exemptions ce ON s.studentID = ce.studentID
+            WHERE s.town = ?
+        `, [date, date, town]);
 
-            const classes = rows.reduce((acc, row) => {
-                  if (!acc[row.class]) {
-                        acc[row.class] = { normal: [], advanced: [], credit: [], exempted: [] };
-                  }
+        const classes = rows.reduce((acc, row) => {
+            if (!acc[row.class]) {
+                acc[row.class] = { normal: [], advanced: [], credit: [], exempted: [] };
+            }
 
-                  // DYNAMIC SORTING LOGIC
-                  if (row.is_exempted === 1) {
-                        acc[row.class].exempted.push(row);
-                  } else if (row.is_credit === 1) {
-                        acc[row.class].credit.push(row);
-                  } else if (row.advance_balance > 0) {
-                        acc[row.class].advanced.push(row);
-                  } else {
-                        acc[row.class].normal.push(row);
-                  }
+            // Categorization Logic
+            if (row.is_exempted === 1) {
+                acc[row.class].exempted.push(row);
+            } else if (row.is_credit === 1) {
+                acc[row.class].credit.push(row);
+            } else if (row.advance_balance > 0) {
+                acc[row.class].advanced.push(row);
+            } else {
+                acc[row.class].normal.push(row);
+            }
+            return acc;
+        }, {});
 
-                  return acc;
-            }, {});
-
-            res.json({ success: true, data: { classes } });
-      } catch (err) {
-            console.error(err);
-            res.status(500).json({ success: false, message: "Database error" });
-      }
+        res.json({ success: true, data: { classes } });
+    } catch (err) {
+        console.error("GET Collect Error:", err);
+        res.status(500).json({ success: false, message: "Database error" });
+    }
 });
 
 /**
@@ -67,112 +65,109 @@ router.get('/collect', async (req, res) => {
   */
 
 router.post('/collect', async (req, res) => {
-   const { town, date, classData, attendance, amounts, collectedBy } = req.body;
-   const finalCollectorID = collectedBy || req.body.adminID || req.body.userId;
+    const { town, date, classData, attendance, amounts, collectedBy } = req.body;
+    const finalCollectorID = collectedBy || req.body.adminID || req.body.userId;
 
-   if (!finalCollectorID) {
-      return res.status(400).json({ success: false, message: "Security Error: No Collector ID found." });
-   }
+    if (!finalCollectorID) {
+        return res.status(400).json({ success: false, message: "Security Error: No Collector ID found." });
+    }
 
-   let conn;
-   try {
-      conn = await db.getConnection();
-      await conn.beginTransaction();
+    let conn;
+    try {
+        conn = await db.getConnection();
+        await conn.beginTransaction();
 
-      const [feeRow] = await conn.query('SELECT daily_fee FROM town_fees WHERE town = ?', [town]);
-      const dailyFee = Number(feeRow[0]?.daily_fee || 0);
+        const [feeRow] = await conn.query('SELECT daily_fee FROM town_fees WHERE town = ?', [town]);
+        const dailyFee = Number(feeRow[0]?.daily_fee || 0);
 
-      for (const [className, categories] of Object.entries(classData)) {
-         const allStudents = [
-            ...(categories.normal || []).map(s => ({ ...s, type: 'daily' })),
-            ...(categories.advanced || []).map(s => ({ ...s, type: 'advance' })),
-            ...(categories.credit || []).map(s => ({ ...s, type: 'credit' })),
-            ...(categories.exempted || []).map(s => ({ ...s, type: 'exempt' })) // Map to 'exempt'
-         ];
+        for (const [className, categories] of Object.entries(classData)) {
+            const allStudents = [
+                ...(categories.normal || []).map(s => ({ ...s, type: 'daily' })),
+                ...(categories.advanced || []).map(s => ({ ...s, type: 'advance' })),
+                ...(categories.credit || []).map(s => ({ ...s, type: 'credit' })),
+                ...(categories.exempted || []).map(s => ({ ...s, type: 'exempt' }))
+            ];
 
-         for (const student of allStudents) {
-            const isPresentNow = !!attendance[student.studentID];
+            for (const student of allStudents) {
+                const isPresentNow = !!attendance[student.studentID];
 
-            // Check current status for this student on this date
-            const [existing] = await conn.query(
-               `SELECT amount, paymentType FROM canteen_fees WHERE studentID = ? AND date = ?`,
-               [student.studentID, date]
-            );
+                // 1. Fetch current database state for this student today
+                const [existing] = await conn.query(
+                    `SELECT amount, paymentType FROM canteen_fees WHERE studentID = ? AND date = ?`,
+                    [student.studentID, date]
+                );
+                const hasExistingRecord = existing.length > 0;
 
-            const hasExistingRecord = existing.length > 0;
-            if (hasExistingRecord && existing[0].paymentType === 'advance_topup') continue;
+                // --- CASE A: STUDENT IS ABSENT (UNCHECKED) ---
+                if (!isPresentNow) {
+                    if (hasExistingRecord) {
+                        const prevAmount = existing[0].amount;
+                        const prevType = existing[0].paymentType;
 
-            // --- 1. HANDLE ABSENTEES (REVERSALS) ---
-            if (!isPresentNow) {
-               if (hasExistingRecord) {
-                    const prevAmount = existing[0].amount;
-                    const prevType = existing[0].paymentType;
+                        // Refund if they were Advance or Credit
+                        if (prevType === 'advance' || prevType === 'credit') {
+                            await conn.query(
+                                `UPDATE canteen_balances SET balance = balance + ? WHERE studentID = ?`,
+                                [prevAmount, student.studentID]
+                            );
+                        }
+                        // Remove records
+                        await conn.query(`DELETE FROM canteen_fees WHERE studentID = ? AND date = ?`, [student.studentID, date]);
+                        await conn.query(`DELETE FROM attendance WHERE studentID = ? AND date = ? AND source = 'canteen'`, [student.studentID, date]);
+                    }
+                    continue; 
+                }
 
-                    // If they were Advance or Credit, refund their exact previous amount to balance
-                    if (prevType === 'advance' || prevType === 'credit') {
-                        await conn.query(
-                           `UPDATE canteen_balances SET balance = balance + ? WHERE studentID = ?`,
-                           [prevAmount, student.studentID]
+                // --- CASE B: STUDENT IS PRESENT (CHECKED) ---
+                let finalAmount = student.type === 'exempt' ? 0 : dailyFee;
+                if (amounts && amounts[student.studentID] !== undefined) {
+                    finalAmount = Number(amounts[student.studentID]);
+                }
+
+                // IMPORTANT: Only deduct balance if this is a NEW marking (prevent double-charging)
+                if (!hasExistingRecord) {
+                    if (student.type === 'credit' || student.type === 'advance') {
+                        await conn.query(`
+                            INSERT INTO canteen_balances (studentID, balance)
+                            VALUES (?, -?)
+                            ON DUPLICATE KEY UPDATE balance = balance - ?`,
+                            [student.studentID, finalAmount, finalAmount]
                         );
                     }
-                    // Remove fee and attendance
-                    await conn.query(`DELETE FROM canteen_fees WHERE studentID = ? AND date = ?`, [student.studentID, date]);
-                    await conn.query(`DELETE FROM attendance WHERE studentID = ? AND date = ? AND source = 'canteen'`, [student.studentID, date]);
-               }
-               continue;
-            }
+                }
 
-            // --- 2. HANDLE PRESENT STUDENTS ---
-            if (isPresentNow) {
-               let finalAmount = student.type === 'exempt' ? 0 : dailyFee;
-               if (amounts && amounts[student.studentID] !== undefined) {
-                  finalAmount = Number(amounts[student.studentID]);
-               }
+                // Upsert Attendance
+                await conn.query(`
+                    INSERT INTO attendance (studentID, date, status, source)
+                    VALUES (?, ?, 'present', 'canteen')
+                    ON DUPLICATE KEY UPDATE status = 'present'`,
+                    [student.studentID, date]
+                );
 
-               // If new record, handle the balance deduction for Debt/Advance
-               if (!hasExistingRecord) {
-                  if (student.type === 'credit' || student.type === 'advance') {
-                     await conn.query(`
-                        INSERT INTO canteen_balances (studentID, balance)
-                        VALUES (?, -?)
-                        ON DUPLICATE KEY UPDATE balance = balance - ?`,
-                        [student.studentID, finalAmount, finalAmount]
-                     );
-                  }
-               }
-
-               // Upsert Attendance (CRITICAL for your reports)
-               await conn.query(`
-                  INSERT INTO attendance (studentID, date, status, source)
-                  VALUES (?, ?, 'present', 'canteen')
-                  ON DUPLICATE KEY UPDATE status = 'present'`,
-                  [student.studentID, date]
-               );
-
-               // Upsert Fees
-               await conn.query(
-                  `INSERT INTO canteen_fees (studentID, amount, date, collectedBy, town, paymentType)
+                // Upsert Fees
+                await conn.query(`
+                    INSERT INTO canteen_fees (studentID, amount, date, collectedBy, town, paymentType)
                     VALUES (?, ?, ?, ?, ?, ?)
-                    ON DUPLICATE KEY UPDATE
-                        amount = VALUES(amount),
+                    ON DUPLICATE KEY UPDATE 
+                        amount = VALUES(amount), 
                         paymentType = VALUES(paymentType),
                         collectedBy = VALUES(collectedBy)`,
-                  [student.studentID, finalAmount, date, finalCollectorID, town, student.type]
-               );
+                    [student.studentID, finalAmount, date, finalCollectorID, town, student.type]
+                );
             }
-         }
-      }
+        }
 
-      await conn.commit();
-      req.app.get('io')?.emit('refresh_data');
-      res.json({ success: true });
+        await conn.commit();
+        req.app.get('io')?.emit('refresh_data');
+        res.json({ success: true });
 
-   } catch (err) {
-      if (conn) await conn.rollback();
-      res.status(500).json({ success: false, error: err.message });
-   } finally {
-      if (conn) conn.release();
-   }
+    } catch (err) {
+        if (conn) await conn.rollback();
+        console.error("POST Collect Error:", err);
+        res.status(500).json({ success: false, error: err.message });
+    } finally {
+        if (conn) conn.release();
+    }
 });
 
 
