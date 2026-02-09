@@ -8,6 +8,7 @@ const db = require('../db/connection');
   */
 
 
+// GET /canteen/collect
 router.get('/collect', async (req, res) => {
     const { town, date } = req.query;
 
@@ -21,7 +22,7 @@ router.get('/collect', async (req, res) => {
                 s.studentID, s.Fname, s.Lname, s.class, s.town,
                 a.status as attendanceStatus,
                 cf.amount as paidAmount,
-                cf.paymentType as lastPaymentType,
+                cf.paymentType as recordedPaymentType,
                 cb.balance as advance_balance,
                 IFNULL(c_flag.active, 0) as is_credit,
                 IFNULL(ce.active, 0) as is_exempted
@@ -39,16 +40,23 @@ router.get('/collect', async (req, res) => {
                 acc[row.class] = { normal: [], advanced: [], credit: [], exempted: [] };
             }
 
-            // Categorization Logic
+            // --- CATEGORIZATION LOGIC WITH "DAY-OF" FREEZE ---
+            let category = 'normal';
             if (row.is_exempted === 1) {
-                acc[row.class].exempted.push(row);
+                category = 'exempted';
             } else if (row.is_credit === 1) {
-                acc[row.class].credit.push(row);
-            } else if (row.advance_balance > 0) {
-                acc[row.class].advanced.push(row);
+                category = 'credit';
+            } else if (row.recordedPaymentType === 'advance' || (row.advance_balance > 0 && !row.recordedPaymentType)) {
+                // Keep them in Advanced if they already used balance today OR have balance remaining
+                category = 'advanced';
             } else {
-                acc[row.class].normal.push(row);
+                category = 'normal';
             }
+
+            // Ensure name is consistent for frontend
+            row.name = `${row.Fname} ${row.Lname}`;
+            
+            acc[row.class][category].push(row);
             return acc;
         }, {});
 
@@ -59,11 +67,7 @@ router.get('/collect', async (req, res) => {
     }
 });
 
-/**
-  * POST /canteen/collect
-  * Body: { town, date, classData: { className: { normal: [], advanced: [], credit: [], exempted: [] } }, attendance: {}, amounts: {}, collectedBy: number }
-  */
-
+// POST /canteen/collect (Remains robust for edits/sync)
 router.post('/collect', async (req, res) => {
     const { town, date, classData, attendance, amounts, collectedBy } = req.body;
     const finalCollectorID = collectedBy || req.body.adminID || req.body.userId;
@@ -91,40 +95,36 @@ router.post('/collect', async (req, res) => {
             for (const student of allStudents) {
                 const isPresentNow = !!attendance[student.studentID];
 
-                // 1. Fetch current database state for this student today
                 const [existing] = await conn.query(
                     `SELECT amount, paymentType FROM canteen_fees WHERE studentID = ? AND date = ?`,
                     [student.studentID, date]
                 );
                 const hasExistingRecord = existing.length > 0;
 
-                // --- CASE A: STUDENT IS ABSENT (UNCHECKED) ---
+                // CASE A: ABSENT (Unchecked) - Handle Refunds
                 if (!isPresentNow) {
                     if (hasExistingRecord) {
                         const prevAmount = existing[0].amount;
                         const prevType = existing[0].paymentType;
 
-                        // Refund if they were Advance or Credit
                         if (prevType === 'advance' || prevType === 'credit') {
                             await conn.query(
                                 `UPDATE canteen_balances SET balance = balance + ? WHERE studentID = ?`,
                                 [prevAmount, student.studentID]
                             );
                         }
-                        // Remove records
                         await conn.query(`DELETE FROM canteen_fees WHERE studentID = ? AND date = ?`, [student.studentID, date]);
                         await conn.query(`DELETE FROM attendance WHERE studentID = ? AND date = ? AND source = 'canteen'`, [student.studentID, date]);
                     }
                     continue; 
                 }
 
-                // --- CASE B: STUDENT IS PRESENT (CHECKED) ---
+                // CASE B: PRESENT (Checked) - Handle Deductions & Upserts
                 let finalAmount = student.type === 'exempt' ? 0 : dailyFee;
-                if (amounts && amounts[student.studentID] !== undefined) {
+                if (amounts && amounts[student.studentID] !== undefined && amounts[student.studentID] !== "") {
                     finalAmount = Number(amounts[student.studentID]);
                 }
 
-                // IMPORTANT: Only deduct balance if this is a NEW marking (prevent double-charging)
                 if (!hasExistingRecord) {
                     if (student.type === 'credit' || student.type === 'advance') {
                         await conn.query(`
@@ -136,7 +136,6 @@ router.post('/collect', async (req, res) => {
                     }
                 }
 
-                // Upsert Attendance
                 await conn.query(`
                     INSERT INTO attendance (studentID, date, status, source)
                     VALUES (?, ?, 'present', 'canteen')
@@ -144,7 +143,6 @@ router.post('/collect', async (req, res) => {
                     [student.studentID, date]
                 );
 
-                // Upsert Fees
                 await conn.query(`
                     INSERT INTO canteen_fees (studentID, amount, date, collectedBy, town, paymentType)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -158,18 +156,14 @@ router.post('/collect', async (req, res) => {
         }
 
         await conn.commit();
-        req.app.get('io')?.emit('refresh_data');
         res.json({ success: true });
-
     } catch (err) {
         if (conn) await conn.rollback();
-        console.error("POST Collect Error:", err);
         res.status(500).json({ success: false, error: err.message });
     } finally {
         if (conn) conn.release();
     }
 });
-
 
 /**
   * POST /canteen/advance/topup
