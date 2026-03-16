@@ -263,17 +263,17 @@ io.emit('refresh_data', { message: 'New activity detected' });
 
 
 /**
-  * POST /canteen/student/move-group
-  * Body: { studentID, toGroup, town, advanceAmount, date, isPresent }
-  */
+ * POST /canteen/student/move-group
+ * Body: { studentID, toGroup, town, advanceAmount, date, isPresent, collectedBy }
+ */
 router.post('/student/move-group', async (req, res) => {
    const { studentID, toGroup, town, advanceAmount, date, isPresent } = req.body;
 
-   // 1. Better Collector ID handling
+   // 1. Standardize Collector ID
    const collectorID = req.body.collectedBy || req.body.teacherID || req.body.adminID || req.body.userId || 0;
 
    const topUpAmount = parseFloat(advanceAmount) || 0;
-   const today = new Date().toLocaleDateString('en-CA');
+   const today = new Date().toISOString().split('T')[0];
    const recordDate = date || today;
 
    let conn;
@@ -282,10 +282,10 @@ router.post('/student/move-group', async (req, res) => {
       await conn.beginTransaction();
 
       // 2. UPDATE ATTENDANCE
+      // This uses a subquery to pull the class from the students table automatically
       if (recordDate && typeof isPresent !== 'undefined') {
          const status = isPresent ? 'present' : 'absent';
 
-         // Fixed: Getting class from students table to ensure it exists
          await conn.query(
             `INSERT INTO attendance (studentID, date, status, town, source, class)
               VALUES (?, ?, ?, ?, 'canteen', (SELECT class FROM students WHERE studentID = ? LIMIT 1))
@@ -293,6 +293,7 @@ router.post('/student/move-group', async (req, res) => {
             [studentID, recordDate, status, town, studentID]
          );
 
+         // If marked absent, remove any fee record for today
          if (!isPresent) {
             await conn.query(
                `DELETE FROM canteen_fees WHERE studentID = ? AND date = ?`,
@@ -301,29 +302,34 @@ router.post('/student/move-group', async (req, res) => {
          }
       }
 
-      // 3. RESET FLAGS (MATCHED TO YOUR SQL DUMP NAMES)
-      // Note: Removed 's' from table names to match your dump (e.g. flag instead of flags)
-      await conn.query('UPDATE canteen_credit_flag SET active = 0 WHERE studentID = ?', [studentID]);
-      await conn.query('UPDATE canteen_exemption SET active = 0 WHERE studentID = ?', [studentID]);
+      // 3. RESET FLAGS (Using Plural Names from your Dump)
+      await conn.query('UPDATE canteen_credit_flags SET active = 0 WHERE studentID = ?', [studentID]);
+      await conn.query('UPDATE canteen_exemptions SET active = 0 WHERE studentID = ?', [studentID]);
 
       // 4. GROUP-SPECIFIC LOGIC
       if (toGroup === 'credit') {
-         await conn.query('UPDATE canteen_balance SET balance = 0 WHERE studentID = ?', [studentID]);
-         await conn.query('INSERT INTO canteen_credit_flag (studentID, active) VALUES (?, 1) ON DUPLICATE KEY UPDATE active = 1', [studentID]);
+         await conn.query('UPDATE canteen_balances SET balance = 0 WHERE studentID = ?', [studentID]);
+         await conn.query(
+            'INSERT INTO canteen_credit_flags (studentID, active) VALUES (?, 1) ON DUPLICATE KEY UPDATE active = 1', 
+            [studentID]
+         );
 
       } else if (toGroup === 'exempted') {
-         await conn.query('UPDATE canteen_balance SET balance = 0 WHERE studentID = ?', [studentID]);
-         await conn.query('INSERT INTO canteen_exemption (studentID, active) VALUES (?, 1) ON DUPLICATE KEY UPDATE active = 1', [studentID]);
+         await conn.query('UPDATE canteen_balances SET balance = 0 WHERE studentID = ?', [studentID]);
+         await conn.query(
+            'INSERT INTO canteen_exemptions (studentID, active) VALUES (?, 1) ON DUPLICATE KEY UPDATE active = 1', 
+            [studentID]
+         );
 
       } else if (toGroup === 'advanced') {
-         // Update balance (using table name 'canteen_balance' from dump)
+         // Update balance in canteen_balances
          await conn.query(
-            `INSERT INTO canteen_balance (studentID, balance)
+            `INSERT INTO canteen_balances (studentID, balance)
               VALUES (?, ?) ON DUPLICATE KEY UPDATE balance = balance + ?`,
             [studentID, topUpAmount, topUpAmount]
          );
 
-         // Record Revenue
+         // Record Revenue if money was actually paid
          if (topUpAmount > 0) {
             await conn.query(
                `INSERT INTO canteen_fees (studentID, amount, date, collectedBy, town, paymentType)
@@ -334,21 +340,25 @@ router.post('/student/move-group', async (req, res) => {
          }
 
       } else if (toGroup === 'normal') {
-         await conn.query('UPDATE canteen_balance SET balance = 0 WHERE studentID = ?', [studentID]);
+         // Clear balances/flags for daily payers
+         await conn.query('UPDATE canteen_balances SET balance = 0 WHERE studentID = ?', [studentID]);
       }
 
       await conn.commit();
 
-      // 5. Emit refresh
+      // 5. Real-time Refresh
       const io = req.app.get('io');
-      if (io) io.emit('refresh_data', { message: 'Group change detected' });
+      if (io) io.emit('refresh_data', { message: 'Group change detected', studentID });
 
       res.json({ success: true, message: 'Student moved successfully' });
 
    } catch (error) {
       if (conn) await conn.rollback();
-      console.error("Move Group Error Details:", error); // This helps you see the exact SQL error
-      res.status(500).json({ success: false, message: error.sqlMessage || error.message });
+      console.error("Move Group Error Details:", error);
+      res.status(500).json({ 
+         success: false, 
+         message: error.sqlMessage || "Internal Server Error during move" 
+      });
    } finally {
       if (conn) conn.release();
    }
