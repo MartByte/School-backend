@@ -29,6 +29,7 @@
     "socket.io": "^4.8.3"
   },
   "devDependencies": {
-    "@types/pdfkit": "^0.17.2"
+    "@types/pdfkit": "^0.17.2",
+    "nodemon": "^3.1.14"
   }
 }
