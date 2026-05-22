@@ -531,7 +531,7 @@ router.get('/reports/canteen/daily', async (req, res) => {
                     ELSE 6 END) ASC LIMIT 1), 'daily') as pTypes
                     
             FROM students s
-            LEFT JOIN attendance a ON s.studentID = a.studentID AND DATE(a.date) = DATE(?)
+            LEFT JOIN attendance a ON s.studentID = a.studentID AND DATE(a.date) = DATE(?) AND a.source = 'canteen'
             WHERE 1=1
         `;
         
